@@ -49,6 +49,12 @@ class Database:
                 c.execute("ALTER TABLE verified_potholes ADD COLUMN contractor TEXT")
                 c.execute("ALTER TABLE verified_potholes ADD COLUMN road_creation_date TEXT")
 
+            try:
+                c.execute("SELECT status FROM verified_potholes LIMIT 1")
+            except sqlite3.OperationalError:
+                c.execute("ALTER TABLE verified_potholes ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'")
+                c.execute("ALTER TABLE verified_potholes ADD COLUMN smooth_passes INTEGER NOT NULL DEFAULT 0")
+
     def insert_report(self, lat: float, lng: float, device_id: str, confidence: float, severity: str, vertical_power: float, z_variance: float, speed: float, telemetry_json: str, username: str, friendly_name: str, timestamp: int, anomaly_type: str = 'pothole', depth_mm: float = 0.0, area_cm2: float = 0.0, urgency_score: float = 0.0, road_name: str = None, contractor: str = None, road_creation_date: str = None) -> int:
         with self.conn() as c:
             cur = c.execute(
@@ -120,18 +126,36 @@ class Database:
                 
                 c.execute(
                     """UPDATE verified_potholes
-                       SET report_count = ?, severity = ?, mcmc_confidence = ?, depth_mm = ?, area_cm2 = ?, urgency_score = ?, last_updated = ?
+                       SET report_count = ?, severity = ?, mcmc_confidence = ?, depth_mm = ?, area_cm2 = ?, urgency_score = ?, status = 'Active', smooth_passes = 0, last_updated = ?
                        WHERE id = ?""",
                     (new_count, severity, mcmc_confidence, new_depth, new_area, new_urgency, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pothole_id)
                 )
                 return pothole_id
             else:
                 cur = c.execute(
-                    """INSERT INTO verified_potholes (lat, lng, report_count, severity, mcmc_confidence, anomaly_type, depth_mm, area_cm2, urgency_score, road_name, contractor, road_creation_date)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    """INSERT INTO verified_potholes (lat, lng, report_count, severity, mcmc_confidence, anomaly_type, depth_mm, area_cm2, urgency_score, road_name, contractor, road_creation_date, status, smooth_passes)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', 0)""",
                     (lat, lng, report_count, severity, mcmc_confidence, anomaly_type, depth_mm, area_cm2, urgency_score, road_name, contractor, road_creation_date)
                 )
                 return cur.lastrowid
+
+    def register_smooth_pass(self, pothole_id: int) -> dict:
+        """
+        Increments the smooth_passes counter.
+        If smooth_passes reaches 3, updates the status to 'Patched'.
+        Returns the updated row.
+        """
+        with self.conn() as c:
+            existing = c.execute("SELECT smooth_passes, status FROM verified_potholes WHERE id = ?", (pothole_id,)).fetchone()
+            if existing:
+                passes = existing['smooth_passes'] + 1
+                status = 'Patched' if passes >= 3 else existing['status']
+                c.execute(
+                    "UPDATE verified_potholes SET smooth_passes = ?, status = ?, last_updated = ? WHERE id = ?",
+                    (passes, status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pothole_id)
+                )
+                return {"id": pothole_id, "status": status, "smooth_passes": passes}
+            return None
 
     def get_all_potholes(self) -> list:
         with self.conn() as c:

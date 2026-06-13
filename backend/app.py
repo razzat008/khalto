@@ -342,12 +342,15 @@ def sync_data():
             # Evict from detector cache to pick up updated thresholds on next sync event
             detectors.pop(device_id, None)
 
-            # For demo/test mode: ensure all synced telemetry events are treated as potholes
-            result.is_pothole = True
-            if not result.confidence or result.confidence == 0.0:
-                result.confidence = 0.5
-            if result.severity == 'low':
-                result.severity = 'medium'
+            # Check if it's a smooth pass (confidence < 0.2)
+            is_smooth_pass = result.confidence < 0.2
+            if is_smooth_pass:
+                result.is_pothole = False
+            else:
+                # For demo/test mode: ensure confident events are treated nicely
+                result.is_pothole = True
+                if result.severity == 'low':
+                    result.severity = 'medium'
 
             # Determine road name, contractor, and road creation date
             road_name, contractor, creation_date = get_road_metadata(lat, lng)
@@ -426,6 +429,23 @@ def sync_data():
 
                     # Broadcast pothole alert instantly to other active devices via WebSockets
                     socketio.emit('pothole_alert', pothole_obj)
+            
+            # Step 7: Check for Smooth Pass / Patch Detection
+            if is_smooth_pass:
+                # Find any active pothole nearby
+                all_potholes = db.get_all_potholes()
+                for p in all_potholes:
+                    if p['status'] == 'Active' and abs(p['lat'] - lat) < 0.00015 and abs(p['lng'] - lng) < 0.00015:
+                        patch_info = db.register_smooth_pass(p['id'])
+                        if patch_info:
+                            logger.info(f"Smooth pass registered on pothole {p['id']}. Total passes: {patch_info['smooth_passes']}")
+                            if patch_info['status'] == 'Patched':
+                                logger.info(f"Pothole {p['id']} has been PATCHED!")
+                                p['status'] = 'Patched'
+                                p['smooth_passes'] = patch_info['smooth_passes']
+                                socketio.emit('pothole_patched', p)
+                        break
+
         except Exception as e:
             logger.error(f"Error processing synced event: {e}")
             continue

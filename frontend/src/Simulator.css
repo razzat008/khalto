@@ -1,0 +1,238 @@
+.simulator-container {
+    padding: 20px;
+    color: #fff;
+    min-height: 100vh;
+}
+
+.simulator-header {
+    text-align: center;
+    margin-bottom: 40px;
+}
+
+.simulator-header h1 {
+    font-size: 2.5rem;
+    background: linear-gradient(90deg, #ff9a9e 0%, #fecfef 99%, #fecfef 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+
+.sim-controls {
+    margin-top: 20px;
+    display: flex;
+    justify-content: center;
+    gap: 15px;
+}
+
+.sim-controls button {
+    padding: 12px 24px;
+    border: none;
+    border-radius: 8px;
+    background: #5f27cd;
+    color: white;
+    font-weight: bold;
+    cursor: pointer;
+    transition: 0.3s;
+}
+
+.sim-controls button:disabled {
+    background: #341f97;
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.sim-controls button:hover:not(:disabled) {
+    background: #341f97;
+    transform: translateY(-2px);
+}
+
+.simulator-main {
+    display: flex;
+    gap: 40px;
+    max-width: 1200px;
+    margin: 0 auto;
+}
+
+/* 2D Road Animation */
+.road-view {
+    flex: 2;
+    background: #000;
+    border-radius: 15px;
+    position: relative;
+    height: 600px;
+    overflow: hidden;
+    border: 4px solid #57606f;
+}
+
+.road-view canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+}
+
+.vehicle-label3d {
+    background: rgba(0, 0, 0, 0.8);
+    color: white;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.8rem;
+    pointer-events: none;
+    white-space: nowrap;
+}
+
+.v2v-hologram {
+    background: rgba(255, 71, 87, 0.9);
+    color: white;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-weight: bold;
+    font-size: 1.2rem;
+    white-space: nowrap;
+    border: 2px solid white;
+    box-shadow: 0 0 20px rgba(255, 71, 87, 0.8);
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0% { transform: scale(1); box-shadow: 0 0 20px rgba(255, 71, 87, 0.8); }
+    50% { transform: scale(1.05); box-shadow: 0 0 40px rgba(255, 71, 87, 1); }
+    100% { transform: scale(1); box-shadow: 0 0 20px rgba(255, 71, 87, 0.8); }
+}
+
+/* Removed old 2D CSS Animations */
+
+.dashboard-panel {
+    flex: 1;
+    background: rgba(30, 39, 46, 0.8);
+    padding: 20px;
+    border-radius: 15px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.metric-box {
+    background: rgba(0, 0, 0, 0.5);
+    padding: 15px;
+    border-radius: 10px;
+    margin-bottom: 15px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.metric-box .label {
+    font-size: 1.1rem;
+    color: #a4b0be;
+}
+
+.metric-box .value {
+    font-size: 1.5rem;
+    font-weight: bold;
+}
+
+.backend-data-box {
+    margin-top: 30px;
+    padding: 20px;
+    background: rgba(46, 213, 115, 0.1);
+    border: 1px solid #2ed573;
+    border-radius: 10px;
+}
+
+.backend-data-box h3 {
+    color: #2ed573;
+    margin-top: 0;
+}
+
+/* UI Overlays inside 3D View */
+.overlay-minimap {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    background: rgba(30, 39, 46, 0.85);
+    border: 2px solid #57606f;
+    border-radius: 10px;
+    padding: 15px;
+    width: 60px;
+    height: 300px;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.overlay-minimap h4 {
+    margin: 0 0 15px 0;
+    font-size: 0.8rem;
+    color: #a4b0be;
+    text-transform: uppercase;
+    text-align: center;
+}
+
+.minimap-track {
+    position: relative;
+    width: 10px;
+    flex: 1;
+    background: #57606f;
+    border-radius: 5px;
+}
+
+.minimap-scout {
+    position: absolute;
+    top: 20%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 16px;
+    height: 16px;
+    background: #ff4757;
+    border-radius: 50%;
+    border: 2px solid white;
+    box-shadow: 0 0 10px rgba(255, 71, 87, 0.8);
+}
+
+.minimap-follower {
+    position: absolute;
+    top: 80%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 16px;
+    height: 16px;
+    background: #3742fa;
+    border-radius: 50%;
+    border: 2px solid white;
+}
+
+.minimap-pothole {
+    position: absolute;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    border: 2px solid #1e272e;
+    z-index: 5;
+}
+
+.overlay-jerk {
+    position: absolute;
+    top: 340px;
+    left: 20px;
+    background: rgba(30, 39, 46, 0.85);
+    border: 2px solid #57606f;
+    border-radius: 10px;
+    padding: 10px 15px;
+    z-index: 10;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 90px;
+}
+
+.jerk-label {
+    font-size: 0.8rem;
+    color: #a4b0be;
+    margin-bottom: 5px;
+}
+
+.jerk-value {
+    font-size: 1.2rem;
+    font-weight: bold;
+    font-family: monospace;
+}

@@ -1,0 +1,24 @@
+{
+  "name": "mobile-client",
+  "version": "1.0.0",
+  "main": "index.js",
+  "dependencies": {
+    "@react-native-community/netinfo": "11.4.1",
+    "expo": "54",
+    "expo-application": "^56.0.3",
+    "expo-location": "~19.0.8",
+    "expo-sensors": "~15.0.8",
+    "expo-sqlite": "~16.0.10",
+    "expo-status-bar": "~3.0.9",
+    "react": "19.1.0",
+    "react-native": "0.81.5",
+    "react-native-maps": "1.20.1"
+  },
+  "scripts": {
+    "start": "expo start",
+    "android": "expo start --android",
+    "ios": "expo start --ios",
+    "web": "expo start --web"
+  },
+  "private": true
+}

@@ -1,0 +1,59 @@
+========================================================================
+             KHALTO — PROJECT ROAD ANOMALY DETECTION SYSTEM
+                      FULL CHANGE HISTORY LOG
+========================================================================
+
+1. ARCHITECTURE & FOLDER STRUCTURE
+----------------------------------
+* Configured the base directory under `/home/ashwot/.gemini/antigravity/scratch/roadsense`.
+* Established subdirectories:
+  - `backend/`: Python Flask server, SQLite database, signal processing, and clustering algorithms.
+  - `frontend/`: Vite-based React dashboard application.
+  - `mobile-client/`: Expo-based React Native mobile application.
+  - `android-client/`: Android native client dependencies.
+
+2. DATABASE SCHEMA & PERSISTENCE
+--------------------------------
+* Set up SQLite persistence storage on the Flask backend (`backend/roadsense.db`) with schemas mapping:
+  - `users`: Stores authenticated usernames, passwords, device hardware fingerprints, and dynamic friendly names.
+  - `reports`: Tracks logged shocks containing GPS coordinates, speed, computed vertical SVM variance, raw 3-axis accelerometer/gyro scope JSON waveforms, and vehicle class labels.
+  - `active_riders`: Logs live tracking coordinate ticks, speed, vehicle classification, and computed suspension health percentages.
+* Set up SQLite local buffering on the Expo client using `expo-sqlite` to buffer sensor telemetry locally when offline and queue them for server syncing.
+
+3. ADVANCED DIGITAL SIGNAL PROCESSING (DSP) & STATE ESTIMATION
+--------------------------------------------------------------
+* Orientation Compensated Decomposition: Implemented low-pass filters (98% coefficient weight) tracking the gravity vector to extract true vertical acceleration and horizontal dynamic forces, independent of device tilt or placement.
+* Sigmoid Logistic Classifier: Implemented RMS (Root Mean Square), Peak Amplitude, and ZCR (Zero Crossing Rate) feature extraction to filter out transient phone handling drops from true road anomalies.
+* Latency Compensated GPS Projection: Multiplied device speed by GPS latency duration (0.8s lag window) to shift recorded coordinates backward along the vehicle's heading vector for spot-on hazard mapping.
+* DBSCAN Spatial Aggregation: Formed verified pothole clusters using DBSCAN, weighting centroids based on vehicle types (prioritizing car suspension shocks over off-road vehicles) and signal strength.
+* Bayesian MCMC change-point validation: Runs Markov Chain Monte Carlo calculations to evaluate verification confidence scores (0% to 100%) for clusters.
+
+4. FLASK REST API ENDPOINTS
+---------------------------
+* Auth: POST `/api/auth/register` and POST `/api/auth/login` to authenticate users and cache JWT tokens.
+* Sync: POST `/api/sync` to upload buffered local reports from mobile.
+* Real-Time Stream: GET `/api/stream` SSE stream pushing real-time synchronization alerts and rider tracking movements.
+* Live Tracking: POST `/api/location` and GET `/api/locations` to push and fetch live rider coordinates.
+* Stats & Board: GET `/api/stats`, GET `/api/potholes`, and GET `/api/leaderboard` to fetch dashboard records.
+* DB Reset: POST `/api/reset` to refresh the dataset for debugging.
+
+5. REACT WEB DASHBOARD (FRONTEND)
+---------------------------------
+* Leaflet Map Widget: Integrates CartoDB Voyager tiles.
+* Live Telemetry Waveforms: Decodes JSON acceleration packets into vector line paths rendered as inline SVG sparklines in the logs feed.
+* OSRM Route Hazard Auditor: Allows setting Start and Destination points on the map, fetches GeoJSON route line coordinates from OSRM, calculates point-to-segment distance (25m threshold) to find route obstacles, and highlights path hazards in real-time.
+* Online Riders Panel: Visualizes vehicle classification and computed health bars.
+
+6. REACT NATIVE EXPO MOBILE CLIENT
+----------------------------------
+* Native Sensors Loop: Captures high-frequency (50Hz) raw metrics from `expo-sensors`.
+* Hardware Identification: Retreives hardware IDs using `expo-application` for authenticating logins and naming devices.
+* Warning Banner Overlay: Triggers local vibration when approaching verified potholes.
+* Multi-Rider Warning Stream: Receives immediate remote notifications and vibrates when other active users trigger a pothole drop in the vicinity.
+
+7. LIGHTMODE UI AND VISUAL REFINEMENT
+-------------------------------------
+* Cleaned header: Removed line-art logo elements in favor of a clean, premium typographic header ("Khalto").
+* Basemaps: ConfiguredCartoDB Voyager light tiles across both web and mobile client views.
+* Web Dashboard styles: Transitioned all panel backdrops, statistics widgets, input inputs, buttons, and scrollbars in `App.css` to clean slate-based lightmode colors.
+* Mobile styles: Rebuilt the Expo Go client container backgrounds, overlays, login screens, inputs, floating control boards, switches, telemetry cards, and log consoles in `App.js` to premium, lightmode compatible layouts.

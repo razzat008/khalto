@@ -354,7 +354,7 @@ export default function Simulator() {
     return (
         <div className="simulator-container game-ui">
             <div className="simulator-header">
-                <h1>RoadSense: The Game</h1>
+                <h1>Khalto: The Game</h1>
                 <p>Full 3D V2V Simulation with physics-based camera shake and low-poly graphics.</p>
                 <div className="sim-controls">
                     <button onClick={runCinematicSimulation} className="btn-primary">PLAY ENCOUNTER</button>

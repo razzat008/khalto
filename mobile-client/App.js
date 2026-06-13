@@ -1,29 +1,38 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, Text, View, Switch, ScrollView, TouchableOpacity, Vibration, Platform, TextInput, Modal, Image, ActivityIndicator } from 'react-native';
+import { StyleSheet, Text, View, Switch, ScrollView, TouchableOpacity, Vibration, Platform, TextInput, Modal, ActivityIndicator } from 'react-native';
 import { Accelerometer, Gyroscope } from 'expo-sensors';
 import NetInfo from '@react-native-community/netinfo';
 import * as Location from 'expo-location';
 import MapView, { Circle, UrlTile, Polyline, Marker, Callout } from 'react-native-maps';
 import * as Application from 'expo-application';
-import * as ImagePicker from 'expo-image-picker';
+import { io } from 'socket.io-client';
+import { useAudioPlayer } from 'expo-audio';
+import * as Speech from 'expo-speech';
 
-import { 
-  initDatabase, 
-  insertTelemetry, 
-  getUnsyncedReports, 
-  markReportsAsSynced, 
+import {
+  initDatabase,
+  insertTelemetry,
+  getUnsyncedReports,
+  markReportsAsSynced,
   pruneSyncedReports,
   getOrCreateDeviceFingerprint,
   saveAuthSession,
   clearAuthSession
 } from './src/data/db';
 import { computeSafeRoutes, haversineMeters } from './src/utils/safeRouting';
+import * as BleManager from './src/utils/BleManager';
+import SimulationScreen from './src/screens/SimulationScreen';
 
 const WINDOW_SIZE = 50; // 1 second of data at 50Hz
 const VERTICAL_THRESHOLD = 1.0; // High tolerance — only real potholes and hard bumps trigger detection
 const SERVER_IP = '192.168.101.254'; // Flask backend IP address
 
 export default function App() {
+  const [currentScreen, setCurrentScreen] = useState('map'); // 'map' | 'simulation'
+
+  // Audio Player
+  const audioPlayer = useAudioPlayer('https://actions.google.com/sounds/v1/alarms/beep_short.ogg');
+
   // Authentication State
   const [authToken, setAuthToken] = useState(null);
   const [username, setUsername] = useState('');
@@ -48,6 +57,8 @@ export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [deviceFingerprint, setDeviceFingerprint] = useState('');
   const [remoteAlert, setRemoteAlert] = useState(null);
+  const [isDevMode, setIsDevMode] = useState(false);
+  const [gamificationPoints, setGamificationPoints] = useState(120);
   
   // Real-Time Acceleration & Gravity telemetry displayed on screen
   const [accelerometerData, setAccelerometerData] = useState({ x: 0, y: 0, z: 0, variance: 0 });
@@ -65,16 +76,24 @@ export default function App() {
   const [routeStats, setRouteStats] = useState(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [isSearching, setIsSearching] = useState(false);
+  const [searchSuggestions, setSearchSuggestions] = useState([]);
   
   // Rendering / UI States for Routing
   const [isFollowingUser, setIsFollowingUser] = useState(true);
   const [isSameRoute, setIsSameRoute] = useState(false);
   
   // Manual Reporting & CV Scan states
+  const [isReportingMode, setIsReportingMode] = useState(false); // true = next long-press drops a report pin
+  const [reportPin, setReportPin] = useState(null);              // {latitude, longitude}
   const [reportModalVisible, setReportModalVisible] = useState(false);
-  const [reportImage, setReportImage] = useState(null);
   const [reportSeverity, setReportSeverity] = useState('medium');
+  const [reportExperienced, setReportExperienced] = useState(null); // true | false | null
   const [isScanningSatellite, setIsScanningSatellite] = useState(false);
+
+  // BLE Offline P2P states
+  const [bleOfflineMode, setBleOfflineMode] = useState(false);
+  const [isBleScanning, setIsBleScanning] = useState(false);
+  const [bleTestStatus, setBleTestStatus] = useState('idle'); // 'idle'|'scanning'|'found'|'failed'
 
   const mapRef = useRef(null);
 
@@ -205,7 +224,7 @@ export default function App() {
       unsubscribeNet();
       clearInterval(interval);
       if (sseXhrRef.current) {
-        sseXhrRef.current.abort();
+        sseXhrRef.current.disconnect();
       }
     };
   }, []);
@@ -261,65 +280,138 @@ export default function App() {
     }
   };
 
-  const pickImage = async () => {
-    let result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [4, 3],
-      quality: 0.5,
-      base64: true,
-    });
+  // ── BLE Offline Mode lifecycle ─────────────────────────────────────────────
+  useEffect(() => {
+    if (bleOfflineMode) {
+      setIsBleScanning(true);
+      BleManager.startScanning(
+        (pothole) => {
+          // Inject BLE-received pothole into local list
+          setPotholes(prev => {
+            const exists = prev.some(p => Math.abs(p.lat - pothole.lat) < 0.0001 && Math.abs(p.lng - pothole.lng) < 0.0001);
+            if (exists) return prev;
+            addLog(`📡 BLE: New pothole injected from nearby device!`);
+            Vibration.vibrate([0, 300, 100, 300]);
+            return [...prev, { id: `ble_${Date.now()}`, lat: pothole.lat, lng: pothole.lng, severity: pothole.severity, status: 'Unverified', report_count: 1, anomaly_type: 'pothole' }];
+          });
+        },
+        addLog
+      ).then(started => {
+        if (!started) setIsBleScanning(false);
+      });
+    } else {
+      BleManager.stopScanning(addLog);
+      setIsBleScanning(false);
+    }
+    return () => {
+      BleManager.stopScanning();
+    };
+  }, [bleOfflineMode]);
 
-    if (!result.canceled) {
-      setReportImage(result.assets[0]);
+  // ── Report Pothole: Pin-drop flow ─────────────────────────────────────────
+  const enterReportMode = () => {
+    setIsReportingMode(true);
+    setReportPin(null);
+    setReportExperienced(null);
+    setReportSeverity('medium');
+    addLog('📍 Report mode: long-press the map where the pothole is.');
+  };
+
+  const handleMapLongPress = (e) => {
+    const coord = e.nativeEvent.coordinate;
+    if (isReportingMode) {
+      // Drop a purple report pin
+      setReportPin(coord);
+      setReportModalVisible(true);
+      addLog(`📍 Pin dropped at ${coord.latitude.toFixed(5)}, ${coord.longitude.toFixed(5)}`);
+    } else {
+      // Normal behaviour: route planning
+      fetchSafeRoute(coord);
     }
   };
 
+  const cancelReport = () => {
+    setReportModalVisible(false);
+    setReportPin(null);
+    setIsReportingMode(false);
+  };
+
   const submitManualReport = async () => {
-    if (!reportImage) {
-      addLog("Please select an image first.");
-      return;
-    }
-    if (!deadReckoningState.current || !deadReckoningState.current.lat) {
-      addLog("Wait for GPS fix before reporting.");
+    addLog(`[SUBMIT] pin=${JSON.stringify(reportPin)} sev=${reportSeverity}`);
+
+    if (!reportPin) {
+      addLog('❌ No pin dropped — long-press the map first.');
       return;
     }
 
+    const lat = reportPin.latitude;
+    const lng = reportPin.longitude;
+
+    // ── STEP 1: Add to local map instantly (works fully offline) ──
+    const localId = `manual_${Date.now()}`;
+    setPotholes(prev => [
+      ...prev,
+      { id: localId, lat, lng, severity: reportSeverity, status: 'Unverified', report_count: 1, anomaly_type: 'pothole' }
+    ]);
+    addLog(`📍 Pin added to map at ${lat.toFixed(5)}, ${lng.toFixed(5)}`);
+
+    // ── STEP 2: Close modal right away, don't make user wait ──
+    setGamificationPoints(prev => prev + 10);
+    addLog(`🏆 +10 Points! You now have ${gamificationPoints + 10} points.`);
+
+    setReportModalVisible(false);
+    setIsReportingMode(false);
+    setReportPin(null);
+
+    // ── STEP 3: Try syncing to backend in the background ──
+    const token = authTokenRef.current;
+    if (!token) {
+      addLog('⚠️ Not authenticated — saved locally only.');
+      return;
+    }
     try {
+      addLog('[SUBMIT] Syncing to server...');
       const response = await fetch(`http://${SERVER_IP}:5000/api/potholes/manual`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'Authorization': `Bearer ${authTokenRef.current}`
+          'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify({
-          lat: deadReckoningState.current.lat,
-          lng: deadReckoningState.current.lng,
-          severity: reportSeverity,
-          image: reportImage.base64
-        })
+        body: JSON.stringify({ lat, lng, severity: reportSeverity, experienced: reportExperienced })
       });
-      
+      addLog(`[SUBMIT] Server: ${response.status}`);
       if (response.ok) {
-        addLog("Pothole reported successfully!");
-        setReportModalVisible(false);
-        setReportImage(null);
-        downloadPotholesList(authTokenRef.current);
+        addLog('✅ Synced to server!');
+        downloadPotholesList(token);
       } else {
-        addLog("Failed to submit report.");
+        const body = await response.text().catch(() => '');
+        addLog(`⚠️ Sync failed (${response.status}): ${body.slice(0, 60)}`);
       }
     } catch (e) {
-      addLog(`Report error: ${e.message}`);
+      addLog(`⚠️ Server unreachable: ${e.message} — kept locally.`);
     }
   };
 
   const triggerSatelliteScan = async () => {
-    if (!mapRef.current) return;
+    if (!mapRef.current) {
+      addLog('Map not ready.');
+      return;
+    }
     setIsScanningSatellite(true);
-    addLog("Initiating Satellite Vision Scan...");
-    
+    addLog('Initiating Satellite Vision Scan...');
     try {
-      const boundaries = await mapRef.current.getMapBoundaries();
+      let boundaries;
+      try {
+        boundaries = await mapRef.current.getMapBoundaries();
+      } catch {
+        const cLat = deadReckoningState.current?.lat || 27.7172;
+        const cLng = deadReckoningState.current?.lng || 85.3240;
+        boundaries = {
+          southWest: { latitude: cLat - 0.01, longitude: cLng - 0.01 },
+          northEast: { latitude: cLat + 0.01, longitude: cLng + 0.01 }
+        };
+        addLog('Using GPS-based bounding box for scan.');
+      }
       const response = await fetch(`http://${SERVER_IP}:5000/api/satellite-scan`, {
         method: 'POST',
         headers: {
@@ -333,18 +425,53 @@ export default function App() {
           maxLng: boundaries.northEast.longitude
         })
       });
-      
       if (response.ok) {
         const data = await response.json();
-        addLog(data.message);
+        addLog(data.message || 'Scan complete.');
         downloadPotholesList(authTokenRef.current);
       } else {
-        addLog("Satellite scan failed.");
+        const errText = await response.text().catch(() => 'unknown error');
+        addLog(`Scan failed (${response.status}): ${errText.slice(0, 80)}`);
       }
     } catch (e) {
       addLog(`Scan error: ${e.message}`);
     } finally {
       setIsScanningSatellite(false);
+    }
+  };
+
+  const testBleNotification = async () => {
+    setBleTestStatus('scanning');
+    addLog('📡 BLE Test: Broadcasting pothole alert...');
+    const lat = deadReckoningState.current?.lat || 27.7172;
+    const lng = deadReckoningState.current?.lng || 85.3240;
+    try {
+      // Use real BLE advertising via BleManager (degrades gracefully in Expo Go)
+      await BleManager.broadcastAlert(lat, lng, 'high', addLog);
+      setBleTestStatus('found');
+      Vibration.vibrate([0, 200, 100, 200]);
+      setTimeout(() => setBleTestStatus('idle'), 3000);
+    } catch (e) {
+      // Fallback: if BLE fails, push via backend SSE so WiFi users still see it
+      addLog('BLE native unavailable. Falling back to SSE push...');
+      try {
+        const r = await fetch(`http://${SERVER_IP}:5000/api/demo/pothole`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${authTokenRef.current}` },
+          body: JSON.stringify({ lat, lng, severity: 'high', anomaly_type: 'pothole' })
+        });
+        if (r.ok) {
+          setBleTestStatus('found');
+          addLog('✅ Fallback SSE alert sent to all online devices!');
+        } else {
+          setBleTestStatus('failed');
+          addLog('❌ Both BLE and SSE failed — device is fully offline.');
+        }
+      } catch {
+        setBleTestStatus('failed');
+        addLog('❌ Fully offline — no alert sent.');
+      }
+      setTimeout(() => setBleTestStatus('idle'), 3000);
     }
   };
 
@@ -416,10 +543,51 @@ export default function App() {
     }
   };
 
+  // ── AUTOCOMPLETE & SEARCH ───────────────────────────────────────────────
+  const fetchSuggestions = async (text) => {
+    setSearchQuery(text);
+    if (!text.trim()) {
+      setSearchSuggestions([]);
+      return;
+    }
+    try {
+      // Use Photon API for fast, typo-tolerant OpenStreetMap autocomplete
+      // Biased roughly towards Kathmandu area (lat=27.7, lon=85.3)
+      const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(text)}&lat=27.7&lon=85.3&zoom=12&limit=5`;
+      const res = await fetch(url);
+      const data = await res.json();
+      if (data && data.features) {
+        setSearchSuggestions(data.features);
+      }
+    } catch (e) {
+      console.log('Autocomplete error:', e);
+    }
+  };
+
+  const selectSuggestion = (feature) => {
+    const coords = feature.geometry.coordinates; // [lon, lat]
+    const destCoords = { latitude: coords[1], longitude: coords[0] };
+    const name = feature.properties.name || 'Destination';
+    
+    setSearchQuery(name);
+    setSearchSuggestions([]);
+    
+    // Pan map
+    if (mapRef.current) {
+      mapRef.current.animateToRegion({
+        ...destCoords,
+        latitudeDelta: 0.05,
+        longitudeDelta: 0.05
+      }, 1000);
+    }
+    fetchSafeRoute(destCoords);
+  };
+
   const handleSearchDestination = async () => {
     if (!searchQuery.trim()) return;
     setIsSearching(true);
     addLog(`Searching for "${searchQuery}"...`);
+    setSearchSuggestions([]);
     try {
       const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery)}&format=json&limit=1`, {
         headers: {
@@ -451,91 +619,51 @@ export default function App() {
     }
   };
 
-  // Connect to SSE stream on Flask API for push-based alerts
+  // Connect to Socket.IO stream on Flask API for push-based alerts
   const connectToSseStream = (token, myFingerprint) => {
-    const xhr = new XMLHttpRequest();
-    xhr.open('GET', `http://${SERVER_IP}:5000/api/stream?token=${encodeURIComponent(token)}`);
-    let lastIndex = 0;
-    let heartbeatTimer = null;
+    const socket = io(`http://${SERVER_IP}:5000`, {
+      transports: ['websocket'],
+      auth: { token }
+    });
 
-    const resetHeartbeatTimer = () => {
-      if (heartbeatTimer) clearTimeout(heartbeatTimer);
-      heartbeatTimer = setTimeout(() => {
-        addLog('SSE connection lost (heartbeat timeout). Reconnecting...');
+    socket.on('connect', () => {
+      addLog('Socket connected.');
+    });
+
+    socket.on('sync_event', () => {
+      downloadPotholesList(token);
+    });
+
+    socket.on('pothole_alert', async (data) => {
+      // For simulated alerts or real remote alerts
+      if (data.created_by_device !== myFingerprint) {
+        addLog(`🚨 REMOTE ALERT: ${data.created_by} hit pothole! (${data.severity})`);
+        Vibration.vibrate([0, 500, 100, 500]);
+        Speech.speak("ALERT! POTHOLE AHEAD!", { pitch: 1, rate: 0.9, language: 'en' });
+        
         try {
-          xhr.abort();
-        } catch (e) {}
-        sseXhrRef.current = connectToSseStream(token, myFingerprint);
-      }, 45000);
-    };
-
-    resetHeartbeatTimer();
-
-    xhr.onreadystatechange = () => {
-      if (xhr.readyState === 3 || xhr.readyState === 4) {
-        resetHeartbeatTimer();
-        const responseText = xhr.responseText;
-        const newText = responseText.substring(lastIndex);
-        lastIndex = responseText.length;
-
-        const lines = newText.split('\n');
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (trimmed.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(trimmed.substring(6));
-              if (data.type === 'sync') {
-                downloadPotholesList(token);
-              } else if (data.type === 'pothole_alert') {
-                const pothole = data.pothole;
-                // Only alert if it's from another device
-                if (pothole.created_by_device && pothole.created_by_device !== myFingerprint) {
-                  // Check 10m proximity
-                  const dist = deadReckoningState.current.lat ? haversineMeters(deadReckoningState.current.lat, deadReckoningState.current.lng, pothole.lat, pothole.lng) : 999;
-                  if (dist <= 10.0) {
-                    addLog(`🚨 REMOTE ALERT: ${pothole.created_by} hit pothole nearby! (${Math.round(dist)}m)`);
-                    Vibration.vibrate([0, 500, 100, 500]);
-
-                    setRemoteAlert({
-                      device: pothole.created_by,
-                      lat: pothole.lat,
-                      lng: pothole.lng,
-                      timestamp: Date.now()
-                    });
-                  }
-                  downloadPotholesList(token);
-                }
-              }
-            } catch (e) {
-              // Ignore parse errors
-            }
+          if (audioPlayer) {
+            audioPlayer.play();
           }
+        } catch (err) {
+          // Ignore sound errors
         }
+
+        setRemoteAlert({
+          device: data.created_by,
+          lat: data.lat,
+          lng: data.lng,
+          timestamp: Date.now()
+        });
+        downloadPotholesList(token);
       }
-    };
+    });
 
-    xhr.onerror = () => {
-      if (heartbeatTimer) clearTimeout(heartbeatTimer);
-      setTimeout(() => {
-        if (authTokenRef.current === token) {
-          sseXhrRef.current = connectToSseStream(token, myFingerprint);
-        }
-      }, 3000);
-    };
+    socket.on('disconnect', () => {
+      addLog('Socket disconnected.');
+    });
 
-    xhr.onloadend = () => {
-      if (heartbeatTimer) clearTimeout(heartbeatTimer);
-      if (xhr.status !== 200) {
-        setTimeout(() => {
-          if (authTokenRef.current === token) {
-            sseXhrRef.current = connectToSseStream(token, myFingerprint);
-          }
-        }, 3000);
-      }
-    };
-
-    xhr.send();
-    return xhr;
+    return socket;
   };
 
   // Submit Authentication form
@@ -707,6 +835,9 @@ export default function App() {
           
           // Unique early warning vibration sequence (short-short-long pulses)
           Vibration.vibrate([0, 80, 80, 80, 80, 300]);
+          if (pothole.anomaly_type === 'pothole' || !pothole.anomaly_type) {
+             Speech.speak("ALERT! POTHOLE AHEAD!", { pitch: 1, rate: 0.9, language: 'en' });
+          }
         }
         break;
       }
@@ -1085,6 +1216,10 @@ export default function App() {
     );
   }
 
+  if (currentScreen === 'simulation') {
+    return <SimulationScreen onExit={() => setCurrentScreen('map')} />;
+  }
+
   return (
     <View style={styles.container}>
       {/* 1. Full-Screen Map View rendering OpenStreetMap */}
@@ -1094,8 +1229,8 @@ export default function App() {
         initialRegion={initialRegion}
         showsUserLocation={true}
         followsUserLocation={isFollowingUser}
-        onLongPress={(e) => fetchSafeRoute(e.nativeEvent.coordinate)}
-        onTouchStart={() => setIsFollowingUser(false)} // Let user pan map manually
+        onLongPress={handleMapLongPress}
+        onTouchStart={() => setIsFollowingUser(false)}
       >
         <UrlTile
           urlTemplate="https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png"
@@ -1103,18 +1238,18 @@ export default function App() {
           flipY={false}
         />
         
-        {/* Fastest Route — gray border trick for Android compatibility */}
+        {/* Fastest/Shortest Route — bright red and wide to be visible underneath the safest route */}
         {fastestRouteCoords.length > 0 && (
           <React.Fragment>
             <Polyline
               coordinates={fastestRouteCoords}
-              strokeColor="#ffffff"
-              strokeWidth={8}
+              strokeColor="#ef4444"
+              strokeWidth={10}
             />
             <Polyline
               coordinates={fastestRouteCoords}
-              strokeColor="#9ca3af"
-              strokeWidth={4}
+              strokeColor="#dc2626"
+              strokeWidth={5}
               lineDashPattern={[8, 6]}
             />
           </React.Fragment>
@@ -1127,6 +1262,16 @@ export default function App() {
         
         {destination && (
            <Marker coordinate={destination} pinColor="blue" title="Destination" />
+        )}
+
+        {/* Report pin — purple/magenta, shows where user wants to report a pothole */}
+        {reportPin && (
+          <Marker
+            coordinate={reportPin}
+            pinColor="#a855f7"
+            title="Report Here"
+            description={`${reportPin.latitude.toFixed(5)}, ${reportPin.longitude.toFixed(5)}`}
+          />
         )}
 
         {/* Render verified/unverified potholes */}
@@ -1194,21 +1339,51 @@ export default function App() {
         })}
       </MapView>
 
-      {/* Floating Search Bar */}
-      <View style={styles.searchContainer}>
+      {/* Google Maps Style Floating Search Bar */}
+    <View style={styles.searchContainer}>
+        <TouchableOpacity style={styles.searchIconWrapper} onPress={handleSearchDestination} disabled={isSearching}>
+          {isSearching ? (
+             <ActivityIndicator size="small" color="#4b5563" />
+          ) : (
+             <Text style={{ fontSize: 18 }}>🔍</Text>
+          )}
+        </TouchableOpacity>
         <TextInput
           style={styles.searchInput}
-          placeholder="Search destination..."
-          placeholderTextColor="#94a3b8"
+          placeholder="Search here"
+          placeholderTextColor="#4b5563"
           value={searchQuery}
-          onChangeText={setSearchQuery}
+          onChangeText={fetchSuggestions}
           onSubmitEditing={handleSearchDestination}
           returnKeyType="search"
         />
-        <TouchableOpacity style={styles.searchBtn} onPress={handleSearchDestination} disabled={isSearching}>
-          <Text style={styles.searchBtnText}>{isSearching ? '...' : 'Go'}</Text>
-        </TouchableOpacity>
       </View>
+
+      {/* Autocomplete Dropdown */}
+      {searchSuggestions.length > 0 && (
+        <View style={styles.autocompleteDropdown}>
+          {searchSuggestions.map((feature, idx) => {
+            const props = feature.properties;
+            const subtitle = [props.city, props.state, props.country].filter(Boolean).join(', ');
+            return (
+              <TouchableOpacity key={idx} style={styles.autocompleteItem} onPress={() => selectSuggestion(feature)}>
+                <Text style={styles.autocompleteItemText}>{props.name || 'Unknown'}</Text>
+                {subtitle ? <Text style={styles.autocompleteItemSubtext}>{subtitle}</Text> : null}
+              </TouchableOpacity>
+            );
+          })}
+        </View>
+      )}
+
+      {/* Reporting Mode Hint Banner */}
+      {isReportingMode && !reportModalVisible && (
+        <View style={styles.reportingBanner}>
+          <Text style={styles.reportingBannerText}>📍 Long-press the map where the pothole is</Text>
+          <TouchableOpacity onPress={cancelReport}>
+            <Text style={{ color: '#fbbf24', fontWeight: 'bold', marginLeft: 12 }}>✕ Cancel</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       {/* Floating Proximity Warning Banner */}
       {activeWarning && (
@@ -1232,11 +1407,20 @@ export default function App() {
         </View>
       )}
 
+      {/* Gamification Sidebar overlay */}
+      {!isDevMode && (
+        <View style={[styles.gamificationOverlay, { top: 120 }]}>
+          <Text style={{ fontSize: 24, textAlign: 'center' }}>🏆</Text>
+          <Text style={{ color: '#fff', fontWeight: '900', fontSize: 16, marginTop: 4 }}>{gamificationPoints} pts</Text>
+          <Text style={{ color: '#fbbf24', fontSize: 10, fontWeight: 'bold', marginTop: 2 }}>PRO RIDER</Text>
+        </View>
+      )}
+
       {/* 2. Floating Control Overlay Panels */}
       <View style={styles.floatingControls}>
         <View style={styles.headerRow}>
           <View style={{ flex: 1 }}>
-            <Text style={styles.title}>Khalto Tracker</Text>
+            <Text style={styles.title}>Khalto Tracker {isDevMode && '(DEV)'}</Text>
             {routeStats ? (
                <View>
                  <Text style={{ color: '#3b82f6', fontSize: 11, fontWeight: '800', marginTop: 2 }}>
@@ -1250,143 +1434,204 @@ export default function App() {
                </View>
             ) : (
                <Text style={{ color: '#3b82f6', fontSize: 11, fontWeight: '800', marginTop: 1 }}>
-                 Long press map or search to route! User: {username}
+                 Long press map or search to route!
                </Text>
             )}
           </View>
-          <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
-            {!isFollowingUser && (
-              <TouchableOpacity style={[styles.syncBtnSmall, { backgroundColor: '#4b5563' }]} onPress={() => setIsFollowingUser(true)}>
-                <Text style={styles.syncBtnTextSmall}>Recenter</Text>
-              </TouchableOpacity>
-            )}
-            {safestRouteCoords.length > 0 && (
-              <TouchableOpacity style={[styles.syncBtnSmall, { backgroundColor: '#ef4444' }]} onPress={() => { setSafestRouteCoords([]); setFastestRouteCoords([]); setRouteStats(null); setDestination(null); setIsFollowingUser(true); }}>
-                <Text style={styles.syncBtnTextSmall}>Clear</Text>
-              </TouchableOpacity>
-            )}
-
-            <TouchableOpacity style={styles.syncBtnSmall} onPress={() => triggerSync()}>
-              <Text style={styles.syncBtnTextSmall}>Sync</Text>
-            </TouchableOpacity>
-            <TouchableOpacity style={[styles.syncBtnSmall, { backgroundColor: '#374151' }]} onPress={handleLogout}>
-              <Text style={styles.syncBtnTextSmall}>Logout</Text>
-            </TouchableOpacity>
+          <View style={{ flexDirection: 'column', gap: 6, alignItems: 'flex-end' }}>
+             <View style={{ flexDirection: 'row', gap: 6 }}>
+                {!isFollowingUser && (
+                  <TouchableOpacity style={[styles.syncBtnSmall, { backgroundColor: '#4b5563' }]} onPress={() => setIsFollowingUser(true)}>
+                    <Text style={styles.syncBtnTextSmall}>Recenter</Text>
+                  </TouchableOpacity>
+                )}
+                {safestRouteCoords.length > 0 && (
+                  <TouchableOpacity style={[styles.syncBtnSmall, { backgroundColor: '#ef4444' }]} onPress={() => { setSafestRouteCoords([]); setFastestRouteCoords([]); setRouteStats(null); setDestination(null); setIsFollowingUser(true); }}>
+                    <Text style={styles.syncBtnTextSmall}>Clear</Text>
+                  </TouchableOpacity>
+                )}
+             </View>
+             <View style={{ flexDirection: 'row', gap: 6 }}>
+                <TouchableOpacity style={[styles.syncBtnSmall, { backgroundColor: isDevMode ? '#10b981' : '#64748b' }]} onPress={() => setIsDevMode(!isDevMode)}>
+                  <Text style={styles.syncBtnTextSmall}>{isDevMode ? 'Normal Mode' : 'Dev Mode'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity style={[styles.syncBtnSmall, { backgroundColor: '#374151' }]} onPress={handleLogout}>
+                  <Text style={styles.syncBtnTextSmall}>Logout</Text>
+                </TouchableOpacity>
+             </View>
           </View>
         </View>
 
-        {/* Vehicle Class Selector */}
-        <View style={styles.pickerRow}>
-          <Text style={styles.pickerLabel}>Vehicle Class:</Text>
-          <View style={styles.pickerButtons}>
-            {['Standard Bike', 'Off-Road Bike', 'Standard Car', 'Off-Road SUV'].map((vClass) => (
-              <TouchableOpacity
-                key={vClass}
-                style={[styles.pickerBtn, vehicleClass === vClass && styles.pickerBtnActive]}
-                onPress={() => setVehicleClass(vClass)}
-              >
-                <Text style={[styles.pickerBtnText, vehicleClass === vClass && styles.pickerBtnTextActive]}>
-                  {vClass.split(' ')[1]} ({vClass.startsWith('Off-Road') ? 'Off' : 'Std'})
-                </Text>
-              </TouchableOpacity>
-            ))}
-          </View>
-        </View>
+        {/* Normal Mode Controls */}
+        {!isDevMode && (
+           <View>
+             <TouchableOpacity
+               style={[styles.actionBtn, { backgroundColor: isReportingMode ? '#7c3aed' : '#8b5cf6', marginTop: 8 }]}
+               onPress={enterReportMode}
+             >
+               <Text style={styles.actionBtnText}>{isReportingMode ? '📍 Drop Pin...' : '📍 Report Pothole'}</Text>
+             </TouchableOpacity>
 
-        {/* Action Buttons */}
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 10, gap: 10 }}>
-          <TouchableOpacity 
-            style={[styles.actionBtn, { backgroundColor: '#8b5cf6', flex: 1 }]} 
-            onPress={() => setReportModalVisible(true)}
-          >
-            <Text style={styles.actionBtnText}>📷 Report Pothole</Text>
-          </TouchableOpacity>
-          <TouchableOpacity 
-            style={[styles.actionBtn, { backgroundColor: '#10b981', flex: 1 }]} 
-            onPress={triggerSatelliteScan}
-            disabled={isScanningSatellite}
-          >
-            {isScanningSatellite ? (
-              <ActivityIndicator size="small" color="#fff" />
-            ) : (
-              <Text style={styles.actionBtnText}>🛰️ Satellite Scan</Text>
-            )}
-          </TouchableOpacity>
-        </View>
-
-        <View style={styles.switchesRow}>
-          <View style={styles.switchCol}>
-            <Text style={styles.switchLabel}>Record Telemetry</Text>
-            <Switch 
-              value={isRecording} 
-              onValueChange={setIsRecording}
-              trackColor={{ false: '#374151', true: '#3b82f6' }}
-              thumbColor={isRecording ? '#fff' : '#9ca3af'}
-            />
-          </View>
-        </View>
-
-        {/* Real-time accelerometer readings display */}
-        {isRecording && (
-          <View style={styles.telemetryPanel}>
-            <Text style={styles.telemetryTitle}>Orientation Compensated Acceleration (Gs):</Text>
-            <View style={styles.telemetryRow}>
-              <Text style={styles.telemetryText}>X: {accelerometerData.x.toFixed(2)}</Text>
-               <Text style={styles.telemetryText}>Y: {accelerometerData.y.toFixed(2)}</Text>
-              <Text style={styles.telemetryText}>Z: {accelerometerData.z.toFixed(2)}</Text>
-            </View>
-            <Text style={styles.telemetryText}>
-              SVM Var: <Text style={{ color: accelerometerData.variance > VERTICAL_THRESHOLD ? '#ef4444' : '#10b981', fontWeight: 'bold' }}>{accelerometerData.variance.toFixed(5)} Gs²</Text>
-            </Text>
-            <Text style={[styles.telemetryText, { marginTop: 4 }]}>
-              Suspension Health: <Text style={{ color: suspensionHealth > 75 ? '#10b981' : suspensionHealth > 40 ? '#f59e0b' : '#ef4444', fontWeight: 'bold' }}>{suspensionHealth.toFixed(1)}%</Text>
-            </Text>
-          </View>
+             <View style={[styles.switchesRow, { marginTop: 12 }]}>
+               <View style={styles.switchCol}>
+                 <Text style={styles.switchLabel}>Record Telemetry</Text>
+                 <Switch
+                   value={isRecording}
+                   onValueChange={setIsRecording}
+                   trackColor={{ false: '#374151', true: '#3b82f6' }}
+                   thumbColor={isRecording ? '#fff' : '#9ca3af'}
+                 />
+               </View>
+               <View style={styles.switchCol}>
+                  <TouchableOpacity style={styles.syncBtnSmall} onPress={() => triggerSync()}>
+                    <Text style={styles.syncBtnTextSmall}>Sync Data</Text>
+                  </TouchableOpacity>
+               </View>
+             </View>
+           </View>
         )}
 
-        <Text style={styles.logHeader}>Logs Console:</Text>
-        <ScrollView style={styles.logs}>
-          {logs.map((log, index) => (
-            <Text key={index} style={styles.logText}>{log}</Text>
-          ))}
-        </ScrollView>
+        {/* Developer Mode Controls */}
+        {isDevMode && (
+          <View>
+            <View style={{ flexDirection: 'row', gap: 8, marginTop: 8 }}>
+              <TouchableOpacity
+                style={[styles.actionBtn, { backgroundColor: '#10b981', flex: 1 }]}
+                onPress={triggerSatelliteScan}
+                disabled={isScanningSatellite}
+              >
+                {isScanningSatellite ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.actionBtnText}>🛰️ Satellite Scan</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+
+            <TouchableOpacity
+              style={[
+                styles.actionBtn,
+                { 
+                  marginTop: 8,
+                  backgroundColor: bleTestStatus === 'found' ? '#16a34a' : bleTestStatus === 'failed' ? '#dc2626' : bleTestStatus === 'scanning' ? '#6b7280' : '#1d4ed8'
+                }
+              ]}
+              onPress={testBleNotification}
+              disabled={bleTestStatus === 'scanning'}
+            >
+              {bleTestStatus === 'scanning' ? (
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+                  <ActivityIndicator size="small" color="#fff" />
+                  <Text style={styles.actionBtnText}>Broadcasting BLE Alert...</Text>
+                </View>
+              ) : (
+                <Text style={styles.actionBtnText}>
+                  {bleTestStatus === 'found' ? '✅ BLE Alert Sent!' : bleTestStatus === 'failed' ? '❌ BLE Test Failed' : '📡 Test BLE P2P Alert'}
+                </Text>
+              )}
+            </TouchableOpacity>
+
+            <TouchableOpacity 
+              style={[styles.actionBtn, { marginTop: 8, backgroundColor: '#E8630A' }]}
+              onPress={() => setCurrentScreen('simulation')}
+            >
+              <Text style={styles.actionBtnText}>▶ Run Simulation</Text>
+            </TouchableOpacity>
+
+            <View style={styles.switchesRow}>
+              <View style={styles.switchCol}>
+                <Text style={[styles.switchLabel, { color: bleOfflineMode ? '#34d399' : '#0f172a' }]}>
+                  {isBleScanning ? '📡 BLE Active' : '📡 BLE Offline'}
+                </Text>
+                <Switch
+                  value={bleOfflineMode}
+                  onValueChange={setBleOfflineMode}
+                  trackColor={{ false: '#374151', true: '#10b981' }}
+                  thumbColor={bleOfflineMode ? '#fff' : '#9ca3af'}
+                />
+              </View>
+            </View>
+
+            {isRecording && (
+              <View style={styles.telemetryPanel}>
+                <Text style={styles.telemetryTitle}>Orientation Compensated Acceleration (Gs):</Text>
+                <View style={styles.telemetryRow}>
+                  <Text style={styles.telemetryText}>X: {accelerometerData.x.toFixed(2)}</Text>
+                   <Text style={styles.telemetryText}>Y: {accelerometerData.y.toFixed(2)}</Text>
+                  <Text style={styles.telemetryText}>Z: {accelerometerData.z.toFixed(2)}</Text>
+                </View>
+                <Text style={styles.telemetryText}>
+                  SVM Var: <Text style={{ color: accelerometerData.variance > VERTICAL_THRESHOLD ? '#ef4444' : '#10b981', fontWeight: 'bold' }}>{accelerometerData.variance.toFixed(5)} Gs²</Text>
+                </Text>
+                <Text style={[styles.telemetryText, { marginTop: 4 }]}>
+                  Suspension Health: <Text style={{ color: suspensionHealth > 75 ? '#10b981' : suspensionHealth > 40 ? '#f59e0b' : '#ef4444', fontWeight: 'bold' }}>{suspensionHealth.toFixed(1)}%</Text>
+                </Text>
+              </View>
+            )}
+
+            <Text style={styles.logHeader}>Logs Console:</Text>
+            <ScrollView style={styles.logs}>
+              {logs.map((log, index) => (
+                <Text key={index} style={styles.logText}>{log}</Text>
+              ))}
+            </ScrollView>
+          </View>
+        )}
       </View>
 
       <Modal
         animationType="slide"
         transparent={true}
         visible={reportModalVisible}
-        onRequestClose={() => setReportModalVisible(false)}
+        onRequestClose={cancelReport}
       >
         <View style={styles.modalOverlay}>
           <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>Manual Pothole Report</Text>
-            
-            <TouchableOpacity style={styles.imagePickerBtn} onPress={pickImage}>
-              {reportImage ? (
-                <Image source={{ uri: reportImage.uri }} style={styles.previewImage} />
-              ) : (
-                <Text style={styles.imagePickerText}>Tap to add a photo 📷</Text>
-              )}
-            </TouchableOpacity>
+            <Text style={styles.modalTitle}>📍 Report a Pothole</Text>
 
-            <Text style={styles.inputLabel}>Size / Severity</Text>
+            {/* Pinned location — read-only, set by map long-press */}
+            <View style={styles.pinLocationBox}>
+              <Text style={styles.pinLocationLabel}>📌 Pin Location</Text>
+              <Text style={styles.pinLocationCoords}>
+                {reportPin
+                  ? `${reportPin.latitude.toFixed(5)}, ${reportPin.longitude.toFixed(5)}`
+                  : 'No pin dropped yet'}
+              </Text>
+            </View>
+
+            {/* Experience Question */}
+            <Text style={styles.inputLabel}>Did you drive through this pothole?</Text>
+            <View style={{ flexDirection: 'row', gap: 10, marginBottom: 16 }}>
+              <TouchableOpacity
+                style={[styles.sevBtn, { flex: 1 }, reportExperienced === true && styles.sevBtnActive]}
+                onPress={() => setReportExperienced(true)}
+              >
+                <Text style={[styles.sevBtnText, reportExperienced === true && styles.sevBtnTextActive]}>✅ Yes, I hit it</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.sevBtn, { flex: 1 }, reportExperienced === false && styles.sevBtnActive]}
+                onPress={() => setReportExperienced(false)}
+              >
+                <Text style={[styles.sevBtnText, reportExperienced === false && styles.sevBtnTextActive]}>👁 I saw it</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* Severity */}
+            <Text style={styles.inputLabel}>Pothole Size</Text>
             <View style={styles.severityRow}>
-              {['low', 'medium', 'high'].map(sev => (
-                <TouchableOpacity 
-                  key={sev} 
-                  style={[styles.sevBtn, reportSeverity === sev && styles.sevBtnActive]}
+              {[['low', '🟡 Small'], ['medium', '🟠 Medium'], ['high', '🔴 Large']].map(([sev, label]) => (
+                <TouchableOpacity
+                  key={sev}
+                  style={[styles.sevBtn, { flex: 1 }, reportSeverity === sev && styles.sevBtnActive]}
                   onPress={() => setReportSeverity(sev)}
                 >
-                  <Text style={[styles.sevBtnText, reportSeverity === sev && styles.sevBtnTextActive]}>
-                    {sev.charAt(0).toUpperCase() + sev.slice(1)}
-                  </Text>
+                  <Text style={[styles.sevBtnText, reportSeverity === sev && styles.sevBtnTextActive]}>{label}</Text>
                 </TouchableOpacity>
               ))}
             </View>
 
             <View style={styles.modalActions}>
-              <TouchableOpacity style={styles.modalBtnCancel} onPress={() => setReportModalVisible(false)}>
+              <TouchableOpacity style={styles.modalBtnCancel} onPress={cancelReport}>
                 <Text style={styles.modalBtnTextCancel}>Cancel</Text>
               </TouchableOpacity>
               <TouchableOpacity style={styles.modalBtnSubmit} onPress={submitManualReport}>
@@ -1411,6 +1656,77 @@ const styles = StyleSheet.create({
   overlayDim: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: 'rgba(248, 250, 252, 0.6)'
+  },
+  searchContainer: {
+    position: 'absolute',
+    top: 50,
+    left: 16,
+    right: 16,
+    backgroundColor: '#fff',
+    borderRadius: 24,
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 16,
+    height: 52,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 5,
+    zIndex: 100,
+  },
+  autocompleteDropdown: {
+    position: 'absolute',
+    top: 110,
+    left: 16,
+    right: 16,
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    paddingVertical: 8,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.15,
+    shadowRadius: 8,
+    elevation: 5,
+    zIndex: 99,
+  },
+  autocompleteItem: {
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: '#f1f5f9',
+  },
+  autocompleteItemText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#1e293b',
+  },
+  autocompleteItemSubtext: {
+    fontSize: 11,
+    color: '#64748b',
+    marginTop: 2,
+  },
+  searchIconWrapper: {
+    marginRight: 10,
+  },
+  searchInput: {
+    flex: 1,
+    fontSize: 16,
+    color: '#1f2937',
+    fontWeight: '500',
+  },
+  searchRightIcons: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  avatarPlaceholder: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+    backgroundColor: '#3b82f6',
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   authContainer: {
     position: 'absolute',
@@ -1530,6 +1846,52 @@ const styles = StyleSheet.create({
   },
   warnMedium: {
     backgroundColor: '#f97316',
+  },
+  reportingBanner: {
+    position: 'absolute',
+    top: 115,
+    left: 16,
+    right: 16,
+    backgroundColor: '#7c3aed',
+    borderRadius: 12,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 8,
+    zIndex: 102
+  },
+  reportingBannerText: {
+    color: '#fff',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  pinLocationBox: {
+    backgroundColor: '#f3f4f6',
+    borderRadius: 10,
+    padding: 12,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+  },
+  pinLocationLabel: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: '#6b7280',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 4,
+  },
+  pinLocationCoords: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#111827',
+    fontFamily: 'Courier',
   },
   warningText: {
     color: '#fff',
@@ -1782,8 +2144,65 @@ const styles = StyleSheet.create({
     width: '100%',
     height: '100%',
   },
-  inputLabel: {
-    color: '#fff'
+  severityRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginBottom: 20,
+  },
+  sevBtn: {
+    flex: 1,
+    paddingVertical: 12,
+    paddingHorizontal: 8,
+    borderRadius: 10,
+    borderWidth: 2,
+    borderColor: '#d1d5db',
+    backgroundColor: '#f9fafb',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  sevBtnActive: {
+    backgroundColor: '#3b82f6',
+    borderColor: '#3b82f6',
+  },
+  sevBtnText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: '#374151',
+    textAlign: 'center',
+  },
+  sevBtnTextActive: {
+    color: '#fff',
+  },
+  modalActions: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 20,
+  },
+  modalBtnCancel: {
+    flex: 1,
+    paddingVertical: 14,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#e5e7eb',
+    alignItems: 'center',
+    backgroundColor: '#f9fafb',
+  },
+  modalBtnTextCancel: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#6b7280',
+  },
+  modalBtnSubmit: {
+    flex: 2,
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: 'center',
+    backgroundColor: '#8b5cf6',
+  },
+  modalBtnTextSubmit: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: '#fff',
   },
   switchesRow: {
     flexDirection: 'row',
@@ -1872,6 +2291,21 @@ const styles = StyleSheet.create({
     shadowRadius: 6,
     elevation: 6,
     zIndex: 100
+  },
+  gamificationOverlay: {
+    position: 'absolute',
+    top: 70,
+    right: 16,
+    backgroundColor: '#3b82f6',
+    borderRadius: 16,
+    padding: 12,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 6,
+    zIndex: 10
   },
   remoteAlertTitle: {
     color: '#fff',

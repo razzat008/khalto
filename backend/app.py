@@ -248,6 +248,13 @@ def handle_location_update(data):
         
     socketio.emit('location_update', data, include_self=False)
 
+@socketio.on('broadcast_alert')
+def handle_broadcast_alert(data):
+    """
+    Receives alert from the simulation web client and rebroadcasts it to the connected mobile app.
+    """
+    socketio.emit('pothole_alert', data, include_self=False)
+
 @app.route('/api/stream')
 def sse_stream():
     # Deprecated fallback for backward compatibility
@@ -256,7 +263,7 @@ def sse_stream():
 @app.route('/')
 def index_landing():
     return jsonify({
-        "name": "RoadSense API Server",
+        "name": "Khalto API Server",
         "status": "online",
         "endpoints": {
             "/api/potholes": "GET - Retrieve verified potholes list",
@@ -658,40 +665,49 @@ def reset_database():
 def manual_add_pothole():
     """
     Manually report a pothole from the mobile app.
-    Accepts lat, lng, severity, and optionally an image base64.
+    Accepts lat, lng, severity, and optionally experienced (bool).
     """
     data = request.json or {}
     lat = data.get('lat')
     lng = data.get('lng')
     severity = data.get('severity', 'medium')
-    # image_base64 = data.get('image') # We can save this to S3/local disk in a real app
-    
+
     if lat is None or lng is None:
         return jsonify({"error": "lat and lng are required"}), 400
 
-    road_name, contractor, creation_date = get_road_metadata(float(lat), float(lng))
+    try:
+        lat = float(lat)
+        lng = float(lng)
+    except (TypeError, ValueError):
+        return jsonify({"error": "lat and lng must be numbers"}), 400
 
-    # Manually reported potholes are placed into 'Unverified' status until verified
-    pothole_id = db.upsert_verified_pothole(
-        lat=float(lat),
-        lng=float(lng),
-        report_count=1,
-        severity=severity,
-        mcmc_confidence=0.8, # Manual reports get a strong initial confidence
-        anomaly_type='pothole',
-        road_name=road_name,
-        contractor=contractor,
-        creation_date=creation_date,
-        created_by="ManualReporter",
-        created_by_device="ManualReporter"
-    )
-    
-    # Force it to Unverified state initially
-    with db.get_connection() as conn:
-        conn.execute("UPDATE verified_potholes SET status = 'Unverified' WHERE id = ?", (pothole_id,))
-    
-    broadcast_pothole_update()
-    return jsonify({"status": "success", "id": pothole_id}), 201
+    try:
+        road_name, contractor, creation_date = get_road_metadata(lat, lng)
+
+        pothole_id = db.upsert_verified_pothole(
+            lat=lat,
+            lng=lng,
+            report_count=1,
+            severity=severity,
+            mcmc_confidence=0.8,
+            anomaly_type='pothole',
+            road_name=road_name,
+            contractor=contractor,
+            road_creation_date=creation_date
+        )
+
+        with db.conn() as conn:
+            conn.execute(
+                "UPDATE verified_potholes SET status = 'Unverified' WHERE id = ?",
+                (pothole_id,)
+            )
+
+        broadcast_pothole_update()
+        return jsonify({"status": "success", "id": pothole_id}), 201
+
+    except Exception as e:
+        logger.error(f"manual_add_pothole error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 import time
 import random
@@ -699,57 +715,72 @@ import random
 @app.route('/api/satellite-scan', methods=['POST'])
 def satellite_scan():
     """
-    Simulates fetching satellite imagery for a given bounding box,
-    running a computer vision model, and inserting detected potholes.
+    Simulates satellite imagery CV analysis for a given bounding box.
+    Uses a deterministic seed derived from the bbox so the same area always
+    produces the same potholes (realistic for testing & demos).
     """
     data = request.json or {}
     min_lat = data.get('minLat')
     max_lat = data.get('maxLat')
     min_lng = data.get('minLng')
     max_lng = data.get('maxLng')
-    
-    if not all([min_lat, max_lat, min_lng, max_lng]):
-        return jsonify({"error": "Bounding box coordinates required"}), 400
 
-    # 1. Simulate fetching Sentinel/Mapbox tiles and running PyTorch model
-    logger.info(f"Initiating Satellite Vision Scan for area: {min_lat},{min_lng} to {max_lat},{max_lng}")
-    time.sleep(2.5) # Simulate heavy workload
-    
-    # 2. Mathematically generate 1 to 3 random potholes within the viewport
-    num_potholes = random.randint(1, 3)
+    if min_lat is None or max_lat is None or min_lng is None or max_lng is None:
+        return jsonify({"error": "Bounding box coordinates required (minLat, maxLat, minLng, maxLng)"}), 400
+
+    try:
+        min_lat = float(min_lat)
+        max_lat = float(max_lat)
+        min_lng = float(min_lng)
+        max_lng = float(max_lng)
+    except (TypeError, ValueError) as e:
+        return jsonify({"error": f"Invalid coordinates: {e}"}), 400
+
+    logger.info(f"Satellite Vision Scan: ({min_lat},{min_lng}) -> ({max_lat},{max_lng})")
+
+    # Deterministic seed from bbox so same area = same results
+    seed = int(abs(min_lat * 1000) + abs(min_lng * 1000) + abs(max_lat * 100) + abs(max_lng * 100))
+    rng = random.Random(seed)
+
+    num_potholes = rng.randint(1, 3)
     detected = []
-    
+
     for _ in range(num_potholes):
-        plat = random.uniform(float(min_lat), float(max_lat))
-        plng = random.uniform(float(min_lng), float(max_lng))
-        severity = random.choice(['low', 'medium', 'high'])
-        
+        plat = rng.uniform(min_lat, max_lat)
+        plng = rng.uniform(min_lng, max_lng)
+        severity = rng.choice(['low', 'medium', 'high'])
+
         road_name, contractor, creation_date = get_road_metadata(plat, plng)
-        
-        pothole_id = db.upsert_verified_pothole(
-            lat=plat,
-            lng=plng,
-            report_count=0, # 0 means CV detected, hasn't been hit by a car yet
-            severity=severity,
-            mcmc_confidence=0.9, 
-            anomaly_type='pothole',
-            road_name=road_name,
-            contractor=contractor,
-            creation_date=creation_date,
-            created_by="CV_Satellite_Model",
-            created_by_device="CV_Satellite_Model"
-        )
-        
-        with db.get_connection() as conn:
-            conn.execute("UPDATE verified_potholes SET status = 'Unverified' WHERE id = ?", (pothole_id,))
-            
-        detected.append({"id": pothole_id, "lat": plat, "lng": plng, "severity": severity})
-        
+
+        try:
+            pothole_id = db.upsert_verified_pothole(
+                lat=plat,
+                lng=plng,
+                report_count=0,
+                severity=severity,
+                mcmc_confidence=0.9,
+                anomaly_type='pothole',
+                road_name=road_name,
+                contractor=contractor,
+                road_creation_date=creation_date
+            )
+
+            # Mark as Unverified — needs human confirmation before routing avoids it
+            with db.conn() as conn:
+                conn.execute(
+                    "UPDATE verified_potholes SET status = 'Unverified' WHERE id = ?",
+                    (pothole_id,)
+                )
+
+            detected.append({"id": pothole_id, "lat": plat, "lng": plng, "severity": severity})
+        except Exception as e:
+            logger.error(f"Failed to insert satellite-detected pothole: {e}")
+
     broadcast_pothole_update()
-    
+
     return jsonify({
         "status": "success",
-        "message": f"Satellite vision analysis complete. Detected {num_potholes} anomalies.",
+        "message": f"Satellite CV scan complete. Detected {len(detected)} anomalies in viewport.",
         "detected": detected
     }), 200
 

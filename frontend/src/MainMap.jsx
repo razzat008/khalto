@@ -527,7 +527,8 @@ export default function MainMap() {
 
         <div style={{ display: 'flex', gap: '8px', marginBottom: '14px' }}>
           <Link to="/" style={{ flex: 1, padding: '8px', textAlign: 'center', background: '#3b82f6', color: '#fff', borderRadius: '8px', fontSize: '12px', fontWeight: 'bold', textDecoration: 'none' }}>Map View</Link>
-          <Link to="/rigsofrod" style={{ flex: 1, padding: '8px', textAlign: 'center', background: 'rgba(15, 23, 42, 0.05)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', borderRadius: '8px', fontSize: '12px', fontWeight: 'bold', textDecoration: 'none' }}>Simulator</Link>
+          <Link to="/map-simulation" style={{ flex: 1, padding: '8px', textAlign: 'center', background: 'rgba(15, 23, 42, 0.05)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', borderRadius: '8px', fontSize: '12px', fontWeight: 'bold', textDecoration: 'none' }}>2D Simulator</Link>
+          <Link to="/rigsofrod" style={{ flex: 1, padding: '8px', textAlign: 'center', background: 'rgba(15, 23, 42, 0.05)', border: '1px solid var(--border-color)', color: 'var(--text-secondary)', borderRadius: '8px', fontSize: '12px', fontWeight: 'bold', textDecoration: 'none' }}>3D Sim</Link>
         </div>
 
         {/* Demo Mode Panel */}

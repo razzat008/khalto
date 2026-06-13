@@ -52,7 +52,7 @@ class Database:
             try:
                 c.execute("SELECT status FROM verified_potholes LIMIT 1")
             except sqlite3.OperationalError:
-                c.execute("ALTER TABLE verified_potholes ADD COLUMN status TEXT NOT NULL DEFAULT 'Active'")
+                c.execute("ALTER TABLE verified_potholes ADD COLUMN status TEXT NOT NULL DEFAULT 'Unverified'")
                 c.execute("ALTER TABLE verified_potholes ADD COLUMN smooth_passes INTEGER NOT NULL DEFAULT 0")
 
     def insert_report(self, lat: float, lng: float, device_id: str, confidence: float, severity: str, vertical_power: float, z_variance: float, speed: float, telemetry_json: str, username: str, friendly_name: str, timestamp: int, anomaly_type: str = 'pothole', depth_mm: float = 0.0, area_cm2: float = 0.0, urgency_score: float = 0.0, road_name: str = None, contractor: str = None, road_creation_date: str = None) -> int:
@@ -123,21 +123,65 @@ class Database:
                 new_depth = (existing_depth * existing['report_count'] + depth_mm) / new_count
                 new_area = (existing_area * existing['report_count'] + area_cm2) / new_count
                 new_urgency = (existing_urgency * existing['report_count'] + urgency_score) / new_count
+                new_status = 'Active' if new_count >= 3 else 'Unverified'
                 
                 c.execute(
                     """UPDATE verified_potholes
-                       SET report_count = ?, severity = ?, mcmc_confidence = ?, depth_mm = ?, area_cm2 = ?, urgency_score = ?, status = 'Active', smooth_passes = 0, last_updated = ?
+                       SET report_count = ?, severity = ?, mcmc_confidence = ?, depth_mm = ?, area_cm2 = ?, urgency_score = ?, status = ?, smooth_passes = 0, last_updated = ?
                        WHERE id = ?""",
-                    (new_count, severity, mcmc_confidence, new_depth, new_area, new_urgency, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pothole_id)
+                    (new_count, severity, mcmc_confidence, new_depth, new_area, new_urgency, new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pothole_id)
                 )
                 return pothole_id
             else:
+                initial_status = 'Active' if report_count >= 3 else 'Unverified'
                 cur = c.execute(
                     """INSERT INTO verified_potholes (lat, lng, report_count, severity, mcmc_confidence, anomaly_type, depth_mm, area_cm2, urgency_score, road_name, contractor, road_creation_date, status, smooth_passes)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Active', 0)""",
-                    (lat, lng, report_count, severity, mcmc_confidence, anomaly_type, depth_mm, area_cm2, urgency_score, road_name, contractor, road_creation_date)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+                    (lat, lng, report_count, severity, mcmc_confidence, anomaly_type, depth_mm, area_cm2, urgency_score, road_name, contractor, road_creation_date, initial_status)
                 )
                 return cur.lastrowid
+
+    def verify_pothole(self, pothole_id: int) -> dict:
+        """
+        Manually increments the report_count (verification count).
+        If report_count >= 3, updates the status to 'Active'.
+        Returns the updated row dict.
+        """
+        with self.conn() as c:
+            existing = c.execute("SELECT * FROM verified_potholes WHERE id = ?", (pothole_id,)).fetchone()
+            if existing:
+                new_count = existing['report_count'] + 1
+                new_status = 'Active' if new_count >= 3 else existing['status']
+                # Don't downgrade status if it's Patched or something, just strictly handle Unverified -> Active
+                if existing['status'] == 'Unverified' and new_count >= 3:
+                    new_status = 'Active'
+                c.execute(
+                    "UPDATE verified_potholes SET report_count = ?, status = ?, last_updated = ? WHERE id = ?",
+                    (new_count, new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pothole_id)
+                )
+                # Return updated info
+                updated = c.execute("SELECT * FROM verified_potholes WHERE id = ?", (pothole_id,)).fetchone()
+                return dict(updated)
+            return None
+
+    def update_pothole_status(self, pothole_id: int, new_status: str) -> dict:
+        """
+        Manually overrides the status of a pothole (e.g., to 'Patched', 'Active', or 'Unverified').
+        """
+        valid_statuses = ['Active', 'Unverified', 'Patched']
+        if new_status not in valid_statuses:
+            return None
+            
+        with self.conn() as c:
+            existing = c.execute("SELECT * FROM verified_potholes WHERE id = ?", (pothole_id,)).fetchone()
+            if existing:
+                c.execute(
+                    "UPDATE verified_potholes SET status = ?, last_updated = ? WHERE id = ?",
+                    (new_status, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), pothole_id)
+                )
+                updated = c.execute("SELECT * FROM verified_potholes WHERE id = ?", (pothole_id,)).fetchone()
+                return dict(updated)
+            return None
 
     def register_smooth_pass(self, pothole_id: int) -> dict:
         """

@@ -1,11 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { StyleSheet, Text, View, Switch, ScrollView, TouchableOpacity, Vibration, Platform, TextInput, Modal, Image, ActivityIndicator } from 'react-native';
+import { StyleSheet, Text, View, Switch, ScrollView, TouchableOpacity, Vibration, Platform, TextInput } from 'react-native';
 import { Accelerometer, Gyroscope } from 'expo-sensors';
 import NetInfo from '@react-native-community/netinfo';
 import * as Location from 'expo-location';
-import MapView, { Circle, UrlTile, Polyline, Marker, Callout } from 'react-native-maps';
+import MapView, { Circle, UrlTile } from 'react-native-maps';
 import * as Application from 'expo-application';
-import * as ImagePicker from 'expo-image-picker';
 
 import { 
   initDatabase, 
@@ -15,13 +14,26 @@ import {
   pruneSyncedReports,
   getOrCreateDeviceFingerprint,
   saveAuthSession,
+  getAuthSession,
   clearAuthSession
 } from './src/data/db';
-import { computeSafeRoutes, haversineMeters } from './src/utils/safeRouting';
 
 const WINDOW_SIZE = 50; // 1 second of data at 50Hz
-const VERTICAL_THRESHOLD = 1.0; // High tolerance — only real potholes and hard bumps trigger detection
+const VERTICAL_THRESHOLD = 3.0; // High tolerance — only real potholes and hard bumps trigger detection
 const SERVER_IP = '192.168.101.254'; // Flask backend IP address
+
+// Math helper: Haversine distance in meters
+function calculateDistance(lat1, lon1, lat2, lon2) {
+  const R = 6371000; // Earth radius in meters
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = 
+    Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
+    Math.sin(dLon/2) * Math.sin(dLon/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
 
 export default function App() {
   // Authentication State
@@ -57,25 +69,6 @@ export default function App() {
   const [potholes, setPotholes] = useState([]);
   const [incidents, setIncidents] = useState([]);
   const [activeWarning, setActiveWarning] = useState(null);
-  
-  // Routing states
-  const [destination, setDestination] = useState(null);
-  const [safestRouteCoords, setSafestRouteCoords] = useState([]);
-  const [fastestRouteCoords, setFastestRouteCoords] = useState([]);
-  const [routeStats, setRouteStats] = useState(null);
-  const [searchQuery, setSearchQuery] = useState('');
-  const [isSearching, setIsSearching] = useState(false);
-  
-  // Rendering / UI States for Routing
-  const [isFollowingUser, setIsFollowingUser] = useState(true);
-  const [isSameRoute, setIsSameRoute] = useState(false);
-  
-  // Manual Reporting & CV Scan states
-  const [reportModalVisible, setReportModalVisible] = useState(false);
-  const [reportImage, setReportImage] = useState(null);
-  const [reportSeverity, setReportSeverity] = useState('medium');
-  const [isScanningSatellite, setIsScanningSatellite] = useState(false);
-
   const mapRef = useRef(null);
 
   const verticalBuffer = useRef([]);
@@ -244,213 +237,6 @@ export default function App() {
     }
   };
 
-  const handleVerifyPothole = async (potholeId) => {
-    try {
-      const response = await fetch(`http://${SERVER_IP}:5000/api/potholes/${potholeId}/verify`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${authTokenRef.current}`
-        }
-      });
-      if (response.ok) {
-        addLog(`Pothole ${potholeId} manually verified!`);
-        downloadPotholesList();
-      }
-    } catch (e) {
-      addLog(`Failed to verify pothole: ${e.message}`);
-    }
-  };
-
-  const pickImage = async () => {
-    let result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ImagePicker.MediaTypeOptions.Images,
-      allowsEditing: true,
-      aspect: [4, 3],
-      quality: 0.5,
-      base64: true,
-    });
-
-    if (!result.canceled) {
-      setReportImage(result.assets[0]);
-    }
-  };
-
-  const submitManualReport = async () => {
-    if (!reportImage) {
-      addLog("Please select an image first.");
-      return;
-    }
-    if (!deadReckoningState.current || !deadReckoningState.current.lat) {
-      addLog("Wait for GPS fix before reporting.");
-      return;
-    }
-
-    try {
-      const response = await fetch(`http://${SERVER_IP}:5000/api/potholes/manual`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${authTokenRef.current}`
-        },
-        body: JSON.stringify({
-          lat: deadReckoningState.current.lat,
-          lng: deadReckoningState.current.lng,
-          severity: reportSeverity,
-          image: reportImage.base64
-        })
-      });
-      
-      if (response.ok) {
-        addLog("Pothole reported successfully!");
-        setReportModalVisible(false);
-        setReportImage(null);
-        downloadPotholesList(authTokenRef.current);
-      } else {
-        addLog("Failed to submit report.");
-      }
-    } catch (e) {
-      addLog(`Report error: ${e.message}`);
-    }
-  };
-
-  const triggerSatelliteScan = async () => {
-    if (!mapRef.current) return;
-    setIsScanningSatellite(true);
-    addLog("Initiating Satellite Vision Scan...");
-    
-    try {
-      const boundaries = await mapRef.current.getMapBoundaries();
-      const response = await fetch(`http://${SERVER_IP}:5000/api/satellite-scan`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${authTokenRef.current}`
-        },
-        body: JSON.stringify({
-          minLat: boundaries.southWest.latitude,
-          maxLat: boundaries.northEast.latitude,
-          minLng: boundaries.southWest.longitude,
-          maxLng: boundaries.northEast.longitude
-        })
-      });
-      
-      if (response.ok) {
-        const data = await response.json();
-        addLog(data.message);
-        downloadPotholesList(authTokenRef.current);
-      } else {
-        addLog("Satellite scan failed.");
-      }
-    } catch (e) {
-      addLog(`Scan error: ${e.message}`);
-    } finally {
-      setIsScanningSatellite(false);
-    }
-  };
-
-  const fetchSafeRoute = async (destCoords) => {
-    let startLat = deadReckoningState.current?.lat;
-    let startLng = deadReckoningState.current?.lng;
-
-    if (!startLat || !startLng) {
-      addLog("GPS not fixed. Using default Kathmandu center for testing.");
-      // Fallback to default initial region so simulator testing works immediately
-      startLat = 27.7172;
-      startLng = 85.3240;
-    }
-
-    setDestination(destCoords);
-    addLog(`Calculating safe route to destination...`);
-    try {
-      const destLng = destCoords.longitude;
-      const destLat = destCoords.latitude;
-      
-      const { fastestRoute, safestRoute, isSameRoute: sameRouteStatus } = await computeSafeRoutes(
-        startLat, startLng, destLat, destLng, potholes
-      );
-
-      // ── DIAGNOSTIC: confirm OSRM is returning alternatives ──
-      addLog(`OSRM returned routes. Same route: ${sameRouteStatus}`);
-      addLog(`Fastest score: ${fastestRoute.dangerScore}, Safest score: ${safestRoute.dangerScore}`);
-
-      setIsSameRoute(sameRouteStatus);
-
-      // Convert from internal [lon, lat] to renderable {latitude, longitude}
-      const fastestCoords = fastestRoute.rawCoordinates.map(c => ({ latitude: c[1], longitude: c[0] }));
-      const safestCoords = safestRoute.rawCoordinates.map(c => ({ latitude: c[1], longitude: c[0] }));
-      
-      setFastestRouteCoords(fastestCoords);
-      setSafestRouteCoords(safestCoords);
-
-      // ── FIX: stop following user, then zoom to show the full route ──
-      setIsFollowingUser(false);
-
-      // Wait one frame for state to flush before fitting
-      setTimeout(() => {
-        if (mapRef.current && safestCoords.length > 0) {
-          mapRef.current.fitToCoordinates(
-            [...safestCoords, ...fastestCoords],
-            {
-              edgePadding: { top: 80, right: 40, bottom: 200, left: 40 },
-              animated: true,
-            }
-          );
-        }
-      }, 100);
-      
-      setRouteStats({
-        safest: {
-          distance: (safestRoute.distanceMeters / 1000).toFixed(1),
-          duration: Math.round(safestRoute.durationSeconds / 60),
-          dangerScore: safestRoute.dangerScore
-        },
-        fastest: {
-          distance: (fastestRoute.distanceMeters / 1000).toFixed(1),
-          duration: Math.round(fastestRoute.durationSeconds / 60),
-          dangerScore: fastestRoute.dangerScore
-        }
-      });
-      addLog(`Routes Found. Safest: ${safestRoute.dangerScore} potholes, Fastest: ${fastestRoute.dangerScore} potholes.`);
-    } catch (e) {
-      addLog(`Routing failed: ${e.message}`);
-    }
-  };
-
-  const handleSearchDestination = async () => {
-    if (!searchQuery.trim()) return;
-    setIsSearching(true);
-    addLog(`Searching for "${searchQuery}"...`);
-    try {
-      const res = await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(searchQuery)}&format=json&limit=1`, {
-        headers: {
-          'User-Agent': 'RoadSenseMobileClient/1.0'
-        }
-      });
-      const data = await res.json();
-      if (data && data.length > 0) {
-        const destCoords = {
-          latitude: parseFloat(data[0].lat),
-          longitude: parseFloat(data[0].lon)
-        };
-        // Pan map
-        if (mapRef.current) {
-          mapRef.current.animateToRegion({
-            ...destCoords,
-            latitudeDelta: 0.05,
-            longitudeDelta: 0.05
-          }, 1000);
-        }
-        fetchSafeRoute(destCoords);
-      } else {
-        addLog(`No results found for "${searchQuery}"`);
-      }
-    } catch (e) {
-      addLog(`Search error: ${e.message}`);
-    } finally {
-      setIsSearching(false);
-    }
-  };
-
   // Connect to SSE stream on Flask API for push-based alerts
   const connectToSseStream = (token, myFingerprint) => {
     const xhr = new XMLHttpRequest();
@@ -488,21 +274,17 @@ export default function App() {
                 downloadPotholesList(token);
               } else if (data.type === 'pothole_alert') {
                 const pothole = data.pothole;
-                // Only alert if it's from another device
-                if (pothole.created_by_device && pothole.created_by_device !== myFingerprint) {
-                  // Check 10m proximity
-                  const dist = deadReckoningState.current.lat ? haversineMeters(deadReckoningState.current.lat, deadReckoningState.current.lng, pothole.lat, pothole.lng) : 999;
-                  if (dist <= 10.0) {
-                    addLog(`🚨 REMOTE ALERT: ${pothole.created_by} hit pothole nearby! (${Math.round(dist)}m)`);
-                    Vibration.vibrate([0, 500, 100, 500]);
+                if (pothole.created_by !== friendlyName) {
+                  addLog(`🚨 REMOTE ALERT: ${pothole.created_by} reported pothole!`);
+                  Vibration.vibrate([0, 500, 100, 500]);
 
-                    setRemoteAlert({
-                      device: pothole.created_by,
-                      lat: pothole.lat,
-                      lng: pothole.lng,
-                      timestamp: Date.now()
-                    });
-                  }
+                  setRemoteAlert({
+                    device: pothole.created_by,
+                    lat: pothole.lat,
+                    lng: pothole.lng,
+                    timestamp: Date.now()
+                  });
+
                   downloadPotholesList(token);
                 }
               }
@@ -683,7 +465,7 @@ export default function App() {
     const triggerDist = 10.0; // Vibrate only when very close (10m) to a pothole
 
     for (const pothole of potholes) {
-      const distance = haversineMeters(
+      const distance = calculateDistance(
         coords.latitude,
         coords.longitude,
         pothole.lat,
@@ -1093,74 +875,39 @@ export default function App() {
         style={styles.map}
         initialRegion={initialRegion}
         showsUserLocation={true}
-        followsUserLocation={isFollowingUser}
-        onLongPress={(e) => fetchSafeRoute(e.nativeEvent.coordinate)}
-        onTouchStart={() => setIsFollowingUser(false)} // Let user pan map manually
+        followsUserLocation={true}
       >
         <UrlTile
           urlTemplate="https://a.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png"
           maximumZ={19}
           flipY={false}
         />
-        
-        {/* Fastest Route — gray border trick for Android compatibility */}
-        {fastestRouteCoords.length > 0 && (
-          <React.Fragment>
-            <Polyline
-              coordinates={fastestRouteCoords}
-              strokeColor="#ffffff"
-              strokeWidth={8}
-            />
-            <Polyline
-              coordinates={fastestRouteCoords}
-              strokeColor="#9ca3af"
-              strokeWidth={4}
-              lineDashPattern={[8, 6]}
-            />
-          </React.Fragment>
-        )}
-        
-        {/* Safest Route — solid blue on top */}
-        {safestRouteCoords.length > 0 && (
-           <Polyline coordinates={safestRouteCoords} strokeColor="#3b82f6" strokeWidth={6} />
-        )}
-        
-        {destination && (
-           <Marker coordinate={destination} pinColor="blue" title="Destination" />
-        )}
-
-        {/* Render verified/unverified potholes */}
+        {/* Render verified potholes */}
         {potholes.map((p) => {
-          if (p.status === 'Patched') return null;
-          
-          const isUnverified = p.status === 'Unverified';
-          const pRadius = p.severity === 'high' ? 8 : p.severity === 'medium' ? 6 : 4;
+          const ANOMALY_COLORS = {
+            pothole: '#ef4444',
+            speed_bump: '#d97706',
+            rough_road: '#854d0e',
+            sudden_brake: '#7c3aed'
+          };
+          const ANOMALY_FILLS = {
+            pothole: 'rgba(239, 68, 68, 0.35)',
+            speed_bump: 'rgba(217, 119, 6, 0.35)',
+            rough_road: 'rgba(133, 77, 14, 0.35)',
+            sudden_brake: 'rgba(124, 58, 237, 0.35)'
+          };
+          const pType = p.anomaly_type || 'pothole';
+          const strokeColor = ANOMALY_COLORS[pType] || '#ef4444';
+          const fillColor = ANOMALY_FILLS[pType] || 'rgba(239, 68, 68, 0.4)';
           return (
-            <React.Fragment key={`pot-${p.id}`}>
-              <Circle
-                center={{ latitude: p.lat, longitude: p.lng }}
-                radius={pRadius}
-                strokeWidth={2}
-                strokeColor={isUnverified ? 'orange' : '#ef4444'}
-                fillColor={isUnverified ? 'rgba(255, 165, 0, 0.3)' : 'rgba(239, 68, 68, 0.35)'}
-              />
-              <Marker
-                coordinate={{ latitude: p.lat, longitude: p.lng }}
-                pinColor={isUnverified ? 'orange' : 'red'}
-              >
-                 <Callout onPress={() => {
-                    if (isUnverified) handleVerifyPothole(p.id);
-                 }}>
-                    <View style={{ padding: 5, alignItems: 'center' }}>
-                       <Text style={{ fontWeight: 'bold' }}>{isUnverified ? 'Unverified Pothole' : 'Active Pothole'}</Text>
-                       <Text style={{ fontSize: 10 }}>Reports: {p.report_count}</Text>
-                       {isUnverified && (
-                          <Text style={{ color: '#3b82f6', marginTop: 4, fontWeight: 'bold' }}>Tap to Verify</Text>
-                       )}
-                    </View>
-                 </Callout>
-              </Marker>
-            </React.Fragment>
+            <Circle
+              key={`pot-${p.id}`}
+              center={{ latitude: p.lat, longitude: p.lng }}
+              radius={p.severity === 'high' ? 8 : p.severity === 'medium' ? 6 : 4}
+              strokeWidth={2}
+              strokeColor={strokeColor}
+              fillColor={fillColor}
+            />
           );
         })}
 
@@ -1194,22 +941,6 @@ export default function App() {
         })}
       </MapView>
 
-      {/* Floating Search Bar */}
-      <View style={styles.searchContainer}>
-        <TextInput
-          style={styles.searchInput}
-          placeholder="Search destination..."
-          placeholderTextColor="#94a3b8"
-          value={searchQuery}
-          onChangeText={setSearchQuery}
-          onSubmitEditing={handleSearchDestination}
-          returnKeyType="search"
-        />
-        <TouchableOpacity style={styles.searchBtn} onPress={handleSearchDestination} disabled={isSearching}>
-          <Text style={styles.searchBtnText}>{isSearching ? '...' : 'Go'}</Text>
-        </TouchableOpacity>
-      </View>
-
       {/* Floating Proximity Warning Banner */}
       {activeWarning && (
         <View style={[styles.warningBanner, activeWarning.severity === 'high' ? styles.warnHigh : styles.warnMedium]}>
@@ -1237,35 +968,11 @@ export default function App() {
         <View style={styles.headerRow}>
           <View style={{ flex: 1 }}>
             <Text style={styles.title}>Khalto Tracker</Text>
-            {routeStats ? (
-               <View>
-                 <Text style={{ color: '#3b82f6', fontSize: 11, fontWeight: '800', marginTop: 2 }}>
-                   🔵 Safest: {routeStats.safest.distance}km, {routeStats.safest.duration}m (Potholes: {routeStats.safest.dangerScore})
-                 </Text>
-                 <Text style={{ color: '#6b7280', fontSize: 11, fontWeight: '800', marginTop: 1 }}>
-                   {routeStats.safest.distance === routeStats.fastest.distance && routeStats.safest.dangerScore === routeStats.fastest.dangerScore 
-                     ? '⚪ Fastest is the Safest route' 
-                     : `⚪ Fastest: ${routeStats.fastest.distance}km, ${routeStats.fastest.duration}m (Potholes: ${routeStats.fastest.dangerScore})`}
-                 </Text>
-               </View>
-            ) : (
-               <Text style={{ color: '#3b82f6', fontSize: 11, fontWeight: '800', marginTop: 1 }}>
-                 Long press map or search to route! User: {username}
-               </Text>
-            )}
+            <Text style={{ color: '#3b82f6', fontSize: 11, fontWeight: '800', marginTop: 1 }}>
+              User: {username} ({friendlyName})
+            </Text>
           </View>
-          <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center' }}>
-            {!isFollowingUser && (
-              <TouchableOpacity style={[styles.syncBtnSmall, { backgroundColor: '#4b5563' }]} onPress={() => setIsFollowingUser(true)}>
-                <Text style={styles.syncBtnTextSmall}>Recenter</Text>
-              </TouchableOpacity>
-            )}
-            {safestRouteCoords.length > 0 && (
-              <TouchableOpacity style={[styles.syncBtnSmall, { backgroundColor: '#ef4444' }]} onPress={() => { setSafestRouteCoords([]); setFastestRouteCoords([]); setRouteStats(null); setDestination(null); setIsFollowingUser(true); }}>
-                <Text style={styles.syncBtnTextSmall}>Clear</Text>
-              </TouchableOpacity>
-            )}
-
+          <View style={{ flexDirection: 'row', gap: 6 }}>
             <TouchableOpacity style={styles.syncBtnSmall} onPress={() => triggerSync()}>
               <Text style={styles.syncBtnTextSmall}>Sync</Text>
             </TouchableOpacity>
@@ -1291,27 +998,6 @@ export default function App() {
               </TouchableOpacity>
             ))}
           </View>
-        </View>
-
-        {/* Action Buttons */}
-        <View style={{ flexDirection: 'row', justifyContent: 'space-between', marginTop: 10, gap: 10 }}>
-          <TouchableOpacity 
-            style={[styles.actionBtn, { backgroundColor: '#8b5cf6', flex: 1 }]} 
-            onPress={() => setReportModalVisible(true)}
-          >
-            <Text style={styles.actionBtnText}>📷 Report Pothole</Text>
-          </TouchableOpacity>
-          <TouchableOpacity 
-            style={[styles.actionBtn, { backgroundColor: '#10b981', flex: 1 }]} 
-            onPress={triggerSatelliteScan}
-            disabled={isScanningSatellite}
-          >
-            {isScanningSatellite ? (
-              <ActivityIndicator size="small" color="#fff" />
-            ) : (
-              <Text style={styles.actionBtnText}>🛰️ Satellite Scan</Text>
-            )}
-          </TouchableOpacity>
         </View>
 
         <View style={styles.switchesRow}>
@@ -1351,51 +1037,6 @@ export default function App() {
           ))}
         </ScrollView>
       </View>
-
-      <Modal
-        animationType="slide"
-        transparent={true}
-        visible={reportModalVisible}
-        onRequestClose={() => setReportModalVisible(false)}
-      >
-        <View style={styles.modalOverlay}>
-          <View style={styles.modalContent}>
-            <Text style={styles.modalTitle}>Manual Pothole Report</Text>
-            
-            <TouchableOpacity style={styles.imagePickerBtn} onPress={pickImage}>
-              {reportImage ? (
-                <Image source={{ uri: reportImage.uri }} style={styles.previewImage} />
-              ) : (
-                <Text style={styles.imagePickerText}>Tap to add a photo 📷</Text>
-              )}
-            </TouchableOpacity>
-
-            <Text style={styles.inputLabel}>Size / Severity</Text>
-            <View style={styles.severityRow}>
-              {['low', 'medium', 'high'].map(sev => (
-                <TouchableOpacity 
-                  key={sev} 
-                  style={[styles.sevBtn, reportSeverity === sev && styles.sevBtnActive]}
-                  onPress={() => setReportSeverity(sev)}
-                >
-                  <Text style={[styles.sevBtnText, reportSeverity === sev && styles.sevBtnTextActive]}>
-                    {sev.charAt(0).toUpperCase() + sev.slice(1)}
-                  </Text>
-                </TouchableOpacity>
-              ))}
-            </View>
-
-            <View style={styles.modalActions}>
-              <TouchableOpacity style={styles.modalBtnCancel} onPress={() => setReportModalVisible(false)}>
-                <Text style={styles.modalBtnTextCancel}>Cancel</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.modalBtnSubmit} onPress={submitManualReport}>
-                <Text style={styles.modalBtnTextSubmit}>Submit Report</Text>
-              </TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
     </View>
   );
 }
@@ -1689,176 +1330,6 @@ const styles = StyleSheet.create({
   remoteAlertBanner: {
     position: 'absolute',
     top: 120,
-    left: 16,
-    right: 16,
-    backgroundColor: '#dc2626',
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 4 },
-    shadowOpacity: 0.3,
-    shadowRadius: 6,
-    elevation: 6,
-    zIndex: 100
-  },
-  remoteAlertTitle: {
-    color: '#fff',
-    fontWeight: '900',
-    fontSize: 14,
-    marginBottom: 4
-  },
-  remoteAlertText: {
-    color: '#fff',
-    fontWeight: '700',
-    fontSize: 12,
-    textAlign: 'center'
-  },
-  remoteAlertCoords: {
-    color: '#fca5a5',
-    fontWeight: '500',
-    fontSize: 10,
-    marginTop: 2
-  }
-,
-
-  // ... (existing styles)
-  warnHigh: {
-    backgroundColor: '#fee2e2',
-    borderColor: '#ef4444',
-  },
-  actionBtn: {
-    paddingVertical: 12,
-    borderRadius: 8,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  actionBtnText: {
-    color: '#fff',
-    fontWeight: 'bold',
-    fontSize: 14,
-  },
-  modalOverlay: {
-    flex: 1,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    justifyContent: 'flex-end',
-  },
-  modalContent: {
-    backgroundColor: '#fff',
-    borderTopLeftRadius: 20,
-    borderTopRightRadius: 20,
-    padding: 24,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: -2 },
-    shadowOpacity: 0.1,
-    shadowRadius: 10,
-    elevation: 5,
-  },
-  modalTitle: {
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 20,
-    textAlign: 'center',
-    color: '#1f2937'
-  },
-  imagePickerBtn: {
-    height: 150,
-    backgroundColor: '#f3f4f6',
-    borderRadius: 12,
-    borderWidth: 2,
-    borderColor: '#d1d5db',
-    borderStyle: 'dashed',
-    justifyContent: 'center',
-    alignItems: 'center',
-    marginBottom: 20,
-    overflow: 'hidden'
-  },
-  imagePickerText: {
-    color: '#6b7280',
-    fontWeight: 'bold',
-  },
-  previewImage: {
-    width: '100%',
-    height: '100%',
-  },
-  inputLabel: {
-    color: '#fff'
-  },
-  switchesRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 10,
-    gap: 12
-  },
-  switchCol: {
-    flex: 1,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    backgroundColor: 'rgba(15, 23, 42, 0.02)',
-    borderWidth: 1,
-    borderColor: 'rgba(15, 23, 42, 0.08)',
-    borderRadius: 10,
-    paddingVertical: 8,
-    paddingHorizontal: 12
-  },
-  switchLabel: {
-    color: '#0f172a',
-    fontSize: 12,
-    fontWeight: '600'
-  },
-  telemetryPanel: {
-    backgroundColor: 'rgba(15, 23, 42, 0.02)',
-    borderWidth: 1,
-    borderColor: 'rgba(15, 23, 42, 0.06)',
-    borderRadius: 12,
-    padding: 10,
-    marginBottom: 10
-  },
-  telemetryTitle: {
-    color: '#475569',
-    fontSize: 9,
-    fontWeight: 'bold',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    marginBottom: 6
-  },
-  telemetryRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    marginBottom: 6
-  },
-  telemetryText: {
-    color: '#0f172a',
-    fontFamily: 'Courier',
-    fontSize: 11
-  },
-  logHeader: {
-    color: '#475569',
-    fontSize: 10,
-    fontWeight: 'bold',
-    textTransform: 'uppercase',
-    letterSpacing: 0.5,
-    marginBottom: 4
-  },
-  logs: {
-    height: 80,
-    backgroundColor: 'rgba(15, 23, 42, 0.04)',
-    borderRadius: 8,
-    padding: 8,
-    borderWidth: 1,
-    borderColor: 'rgba(15, 23, 42, 0.08)'
-  },
-  logText: {
-    fontFamily: 'Courier',
-    fontSize: 10,
-    color: '#16a34a',
-    marginBottom: 2
-  },
-  remoteAlertBanner: {
-    position: 'absolute',
-    top: 180,
     left: 16,
     right: 16,
     backgroundColor: '#dc2626',

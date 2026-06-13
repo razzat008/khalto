@@ -142,97 +142,53 @@
 }
 
 /* UI Overlays inside 3D View */
-.overlay-minimap {
+.overlay-cartoon-map {
     position: absolute;
     top: 20px;
     left: 20px;
-    background: rgba(30, 39, 46, 0.85);
-    border: 2px solid #57606f;
-    border-radius: 10px;
-    padding: 15px;
-    width: 60px;
-    height: 300px;
+    background: #fff;
+    border: 4px solid #57606f;
+    border-radius: 15px;
+    width: 250px;
+    height: 250px;
     z-index: 10;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
+    box-shadow: 0 10px 20px rgba(0,0,0,0.5);
+    overflow: hidden;
 }
 
-.overlay-minimap h4 {
-    margin: 0 0 15px 0;
-    font-size: 0.8rem;
-    color: #a4b0be;
-    text-transform: uppercase;
-    text-align: center;
-}
-
-.minimap-track {
-    position: relative;
-    width: 10px;
-    flex: 1;
-    background: #57606f;
-    border-radius: 5px;
-}
-
-.minimap-scout {
+.hud-jerk {
     position: absolute;
-    top: 20%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: 16px;
-    height: 16px;
-    background: #ff4757;
-    border-radius: 50%;
-    border: 2px solid white;
-    box-shadow: 0 0 10px rgba(255, 71, 87, 0.8);
-}
-
-.minimap-follower {
-    position: absolute;
-    top: 80%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: 16px;
-    height: 16px;
-    background: #3742fa;
-    border-radius: 50%;
-    border: 2px solid white;
-}
-
-.minimap-pothole {
-    position: absolute;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: 20px;
-    height: 20px;
-    border-radius: 50%;
-    border: 2px solid #1e272e;
-    z-index: 5;
-}
-
-.overlay-jerk {
-    position: absolute;
-    top: 340px;
+    bottom: 20px;
     left: 20px;
-    background: rgba(30, 39, 46, 0.85);
-    border: 2px solid #57606f;
-    border-radius: 10px;
-    padding: 10px 15px;
+    background: rgba(0, 0, 0, 0.7);
+    border-left: 4px solid #ff4757;
+    padding: 10px 20px;
     z-index: 10;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    min-width: 90px;
+    color: white;
+    font-family: 'Courier New', Courier, monospace;
 }
 
-.jerk-label {
+.hud-jerk span {
     font-size: 0.8rem;
     color: #a4b0be;
+    display: block;
     margin-bottom: 5px;
 }
 
-.jerk-value {
-    font-size: 1.2rem;
+.hud-jerk .jerk-value {
+    font-size: 2rem;
     font-weight: bold;
-    font-family: monospace;
+}
+
+/* Futuristic Sidebar Panel */
+.futuristic-panel {
+    background: linear-gradient(135deg, rgba(30, 39, 46, 0.9), rgba(10, 15, 20, 0.9));
+    border: 1px solid #3742fa;
+    box-shadow: 0 0 15px rgba(55, 66, 250, 0.2);
+}
+
+.futuristic-panel h3 {
+    color: #7bed9f;
+    font-family: 'Courier New', Courier, monospace;
+    letter-spacing: 2px;
 }

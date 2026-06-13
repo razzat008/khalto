@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS verified_potholes (
     road_name          TEXT,
     contractor         TEXT,
     road_creation_date TEXT,
-    status             TEXT NOT NULL DEFAULT 'Active',
+    status             TEXT NOT NULL DEFAULT 'Unverified',
     smooth_passes      INTEGER NOT NULL DEFAULT 0,
     first_reported     DATETIME DEFAULT CURRENT_TIMESTAMP,
     last_updated       DATETIME DEFAULT CURRENT_TIMESTAMP
